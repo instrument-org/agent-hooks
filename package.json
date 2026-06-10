@@ -1,0 +1,7 @@
+{
+  "name": "@instrument-org/agent-hooks",
+  "version": "1.0.0",
+  "type": "module",
+  "files": ["format.mjs"],
+  "engines": { "node": ">=22" }
+}
