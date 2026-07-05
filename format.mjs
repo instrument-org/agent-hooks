@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const PRETTIER_EXT =
@@ -71,17 +72,83 @@ function formatDirtyFiles(repoRoot) {
   runBatched(repoRoot, prettierFiles, runPrettier);
 }
 
-function lintReportDirtyFiles(repoRoot) {
+// Per-session record of files this session edited, so the Stop report only
+// blocks on the agent's own work -- never on files a *parallel* agent left
+// dirty in the same repo. Keyed by session id, stored outside the repo.
+function sessionEditsFile(sessionId) {
+  return path.join(os.tmpdir(), "instrument-agent-hooks", `${sessionId}.txt`);
+}
+
+function recordSessionEdit(sessionId, absolutePath) {
+  if (!sessionId || !absolutePath) {
+    return;
+  }
+  try {
+    const file = sessionEditsFile(sessionId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${absolutePath}\n`);
+  } catch {
+    // Best effort -- a missing record just means no scoped report this turn.
+  }
+}
+
+function readSessionEdits(sessionId) {
+  if (!sessionId) {
+    return [];
+  }
+  try {
+    const content = fs.readFileSync(sessionEditsFile(sessionId), "utf8");
+    return [
+      ...new Set(
+        content
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean),
+      ),
+    ];
+  } catch {
+    return [];
+  }
+}
+
+// Delete session-edit files older than a week so /tmp does not accumulate.
+function pruneSessionEdits() {
+  try {
+    const directory = path.join(os.tmpdir(), "instrument-agent-hooks");
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    for (const name of fs.readdirSync(directory)) {
+      const file = path.join(directory, name);
+      try {
+        if (now - fs.statSync(file).mtimeMs > weekMs) {
+          fs.unlinkSync(file);
+        }
+      } catch {
+        // Ignore files that vanish or cannot be stat-ed.
+      }
+    }
+  } catch {
+    // Directory may not exist yet -- nothing to prune.
+  }
+}
+
+function lintReportSessionEdits({ editedPaths, repoRoot }) {
   if (!isInstrumentRepoRoot(repoRoot)) {
     return "";
   }
 
-  const eslintFiles = listDirtyPaths(repoRoot).filter((relativePath) => {
-    if (shouldSkipRelative(relativePath) || !ESLINT_EXT.test(relativePath)) {
-      return false;
-    }
-    return fileExists(path.join(repoRoot, relativePath));
-  });
+  const eslintFiles = [
+    ...new Set(
+      editedPaths
+        .map((absolutePath) => getSafeRelativePath({ filePath: absolutePath, repoRoot }))
+        .filter(
+          (relativePath) =>
+            relativePath &&
+            ESLINT_EXT.test(relativePath) &&
+            fileExists(path.join(repoRoot, relativePath)),
+        ),
+    ),
+  ];
 
   return runBatched(repoRoot, eslintFiles, (root, batch) =>
     runEslint(root, batch, { report: true }),
@@ -414,10 +481,9 @@ try {
     typeof data.file_path === "string" &&
     data.file_path.length > 0
   ) {
-    formatEditedFile({
-      filePath: path.resolve(data.file_path),
-      repoRoot,
-    });
+    const filePath = path.resolve(data.file_path);
+    formatEditedFile({ filePath, repoRoot });
+    recordSessionEdit(data.session_id, filePath);
   }
 
   if (eventName === "Stop") {
@@ -426,35 +492,39 @@ try {
       formatDirtyFiles(root);
     }
 
-    // Claude Code Stop only: after formatting, run each package's real ESLint
-    // config on the dirty set and hand any remaining problems back to the agent
-    // so it fixes them in-context instead of discovering them later via a
-    // manual lint run. The format pass above uses a fast formatting-only config
-    // for autofixes; reporting must use the real config so results match
-    // `check:lint`. Other runtimes (Codex "stop") do not honor the block
-    // contract, so they keep formatting silently. Skip when stop_hook_active so
-    // the agent gets a single fix attempt and we never loop on genuinely
-    // unfixable errors.
+    // Claude Code Stop only: run each package's real ESLint config over the
+    // files THIS session edited and hand any remaining problems back to the
+    // agent so it fixes them in-context instead of via a manual lint run. We
+    // scope to the session's own edits (not the whole dirty set) so a parallel
+    // agent's in-flight files never block this one. The format pass above uses
+    // a fast formatting-only config for autofixes; reporting uses the real
+    // config so results match `check:lint`. Other runtimes (Codex "stop") do
+    // not honor the block contract, so they keep formatting silently. Skip when
+    // stop_hook_active so the agent gets a single fix attempt (no loops).
     if (data.hook_event_name === "Stop" && data.stop_hook_active !== true) {
-      let lintReport = "";
-      for (const root of roots) {
-        lintReport += lintReportDirtyFiles(root);
-      }
-      if (lintReport.trim()) {
-        result = JSON.stringify({
-          decision: "block",
-          reason: buildLintReason(lintReport),
-        });
+      pruneSessionEdits();
+      const editedPaths = readSessionEdits(data.session_id);
+      if (editedPaths.length > 0) {
+        let lintReport = "";
+        for (const root of roots) {
+          lintReport += lintReportSessionEdits({ editedPaths, repoRoot: root });
+        }
+        if (lintReport.trim()) {
+          result = JSON.stringify({
+            decision: "block",
+            reason: buildLintReason(lintReport),
+          });
+        }
       }
     }
   }
 
   if (eventName === "PostToolUse" && data.tool_name === "apply_patch") {
-    formatEditedFiles({
-      cwd,
-      filePaths: getCodexEditedPaths(data),
-      repoRoot,
-    });
+    const filePaths = getCodexEditedPaths(data);
+    formatEditedFiles({ cwd, filePaths, repoRoot });
+    for (const filePath of filePaths) {
+      recordSessionEdit(data.session_id, path.resolve(cwd, filePath));
+    }
   }
 
   if (
@@ -463,10 +533,9 @@ try {
     typeof data.tool_input?.file_path === "string" &&
     data.tool_input.file_path.length > 0
   ) {
-    formatEditedFile({
-      filePath: path.resolve(data.tool_input.file_path),
-      repoRoot,
-    });
+    const filePath = path.resolve(data.tool_input.file_path);
+    formatEditedFile({ filePath, repoRoot });
+    recordSessionEdit(data.session_id, filePath);
   }
 } catch (error) {
   console.error("[format-hook]", error?.message ?? error);
