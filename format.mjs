@@ -71,6 +71,23 @@ function formatDirtyFiles(repoRoot) {
   runBatched(repoRoot, prettierFiles, runPrettier);
 }
 
+function lintReportDirtyFiles(repoRoot) {
+  if (!isInstrumentRepoRoot(repoRoot)) {
+    return "";
+  }
+
+  const eslintFiles = listDirtyPaths(repoRoot).filter((relativePath) => {
+    if (shouldSkipRelative(relativePath) || !ESLINT_EXT.test(relativePath)) {
+      return false;
+    }
+    return fileExists(path.join(repoRoot, relativePath));
+  });
+
+  return runBatched(repoRoot, eslintFiles, (root, batch) =>
+    runEslint(root, batch, { report: true }),
+  );
+}
+
 function formatEditedFile({ filePath, repoRoot }) {
   const relativePath = getSafeRelativePath({ filePath, repoRoot });
   if (!relativePath || !fileExists(filePath)) {
@@ -245,26 +262,41 @@ function readStdin() {
 
 function runBatched(repoRoot, files, run) {
   const batchSize = 40;
+  let output = "";
   for (let index = 0; index < files.length; index += batchSize) {
-    run(repoRoot, files.slice(index, index + batchSize));
+    const result = run(repoRoot, files.slice(index, index + batchSize));
+    if (typeof result === "string" && result) {
+      output += result;
+    }
   }
+  return output;
 }
 
-function runEslint(repoRoot, files) {
+function runEslint(repoRoot, files, { report = false } = {}) {
   if (files.length === 0) {
-    return;
+    return "";
   }
   const eslintPath = path.join(repoRoot, "node_modules/.bin/eslint");
   if (!fileExists(eslintPath)) {
-    return;
+    return "";
   }
+  // The fast autofix pass uses the formatting-only config (no typed rules, so
+  // it skips TypeScript project startup). The Stop reporting pass uses each
+  // package's real eslint.config.* instead, so results match `check:lint`
+  // exactly (no false positives such as react/react-in-jsx-scope, no missed
+  // typed rules).
   const formatConfigPath = path.join(
     repoRoot,
     "packages/eslint-config/format.ts",
   );
-  const configArguments = fileExists(formatConfigPath)
-    ? ["--config", formatConfigPath]
-    : [];
+  const configArguments =
+    !report && fileExists(formatConfigPath)
+      ? ["--config", formatConfigPath]
+      : [];
+  // Reporting mode is read-only and treats warnings as failures, matching
+  // `eslint . --max-warnings 0` (check:lint). The autofix pass keeps --fix.
+  const warningArguments = report ? ["--max-warnings=0"] : [];
+  const fixArguments = report ? [] : ["--fix"];
 
   // Group files by their nearest eslint.config directory so each group runs
   // with the correct cwd (and thus the correct package-level config).
@@ -280,21 +312,39 @@ function runEslint(repoRoot, files) {
     groups.get(configDirectory).push(path.resolve(repoRoot, relativePath));
   }
 
+  let output = "";
   for (const [configDirectory, absolutePaths] of groups) {
     try {
       execFileSync(
         eslintPath,
-        [...configArguments, "--no-ignore", "--fix", ...absolutePaths],
+        [
+          ...configArguments,
+          "--no-ignore",
+          ...warningArguments,
+          ...fixArguments,
+          ...absolutePaths,
+        ],
         {
           cwd: configDirectory,
+          encoding: "utf8",
           maxBuffer: 50 * 1024 * 1024,
           stdio: ["ignore", "pipe", "pipe"],
         },
       );
-    } catch {
-      // ESLint exits 1 for unfixable lint errors -- that's expected, ignore.
+    } catch (error) {
+      // ESLint exits 1 for problems that --fix could not resolve. In reporting
+      // mode, capture the remaining problems so the Stop branch can surface
+      // them to the agent.
+      if (report) {
+        const remaining =
+          typeof error.stdout === "string" ? error.stdout : "";
+        if (remaining.trim()) {
+          output += remaining;
+        }
+      }
     }
   }
+  return output;
 }
 
 function runPrettier(repoRoot, files) {
@@ -310,6 +360,15 @@ function runPrettier(repoRoot, files) {
     maxBuffer: 50 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+function buildLintReason(report) {
+  const maxLength = 6000;
+  let body = report.trim();
+  if (body.length > maxLength) {
+    body = `${body.slice(0, maxLength)}\n… (truncated)`;
+  }
+  return `ESLint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
 }
 
 function shouldSkipRelative(relativePath) {
@@ -332,6 +391,7 @@ try {
   process.exit(0);
 }
 
+let result = "{}";
 try {
   const cwd = process.cwd();
   const repoRoot = getRepoRoot(cwd);
@@ -361,8 +421,31 @@ try {
   }
 
   if (eventName === "Stop") {
-    for (const root of getStopRoots({ data, repoRoot })) {
+    const roots = getStopRoots({ data, repoRoot });
+    for (const root of roots) {
       formatDirtyFiles(root);
+    }
+
+    // Claude Code Stop only: after formatting, run each package's real ESLint
+    // config on the dirty set and hand any remaining problems back to the agent
+    // so it fixes them in-context instead of discovering them later via a
+    // manual lint run. The format pass above uses a fast formatting-only config
+    // for autofixes; reporting must use the real config so results match
+    // `check:lint`. Other runtimes (Codex "stop") do not honor the block
+    // contract, so they keep formatting silently. Skip when stop_hook_active so
+    // the agent gets a single fix attempt and we never loop on genuinely
+    // unfixable errors.
+    if (data.hook_event_name === "Stop" && data.stop_hook_active !== true) {
+      let lintReport = "";
+      for (const root of roots) {
+        lintReport += lintReportDirtyFiles(root);
+      }
+      if (lintReport.trim()) {
+        result = JSON.stringify({
+          decision: "block",
+          reason: buildLintReason(lintReport),
+        });
+      }
     }
   }
 
@@ -389,6 +472,6 @@ try {
   console.error("[format-hook]", error?.message ?? error);
 }
 
-process.stdout.write("{}");
+process.stdout.write(result);
 // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit
 process.exit(0);
