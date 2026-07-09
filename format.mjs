@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const PRETTIER_EXT =
-  /\.(?:ts|tsx|mjs|cjs|js|jsx|json|css|scss|md|yaml|yml|html)$/i;
+const OXFMT_EXT =
+  /\.(?:ts|tsx|mjs|cjs|js|jsx|json|jsonc|css|md|mdx|yaml|yml|html)$/i;
 const ESLINT_EXT = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/i;
 
 const INSTRUMENT_ROOT_NAMES = new Set([
@@ -58,18 +58,18 @@ function formatDirtyFiles(repoRoot) {
     return fileExists(path.join(repoRoot, relativePath));
   });
 
-  const prettierFiles = existing.filter((relativePath) =>
-    PRETTIER_EXT.test(relativePath),
+  const oxfmtFiles = existing.filter((relativePath) =>
+    OXFMT_EXT.test(relativePath),
   );
   const eslintFiles = existing.filter((relativePath) =>
     ESLINT_EXT.test(relativePath),
   );
 
-  runBatched(repoRoot, prettierFiles, runPrettier);
+  runBatched(repoRoot, oxfmtFiles, runOxfmt);
   runBatched(repoRoot, eslintFiles, runEslint);
 
-  // ESLint fixes can change layout, so finish with Prettier.
-  runBatched(repoRoot, prettierFiles, runPrettier);
+  // ESLint fixes can change layout, so finish with oxfmt.
+  runBatched(repoRoot, oxfmtFiles, runOxfmt);
 }
 
 // Per-session record of files this session edited, so the Stop report only
@@ -165,8 +165,8 @@ function formatEditedFile({ filePath, repoRoot }) {
     return;
   }
 
-  if (PRETTIER_EXT.test(relativePath)) {
-    runPrettier(repoRoot, [relativePath]);
+  if (OXFMT_EXT.test(relativePath)) {
+    runOxfmt(repoRoot, [relativePath]);
   }
 }
 
@@ -187,16 +187,16 @@ function formatEditedFiles({ cwd, filePaths, repoRoot }) {
     return;
   }
 
-  const prettierFiles = relativePaths.filter((relativePath) =>
-    PRETTIER_EXT.test(relativePath),
+  const oxfmtFiles = relativePaths.filter((relativePath) =>
+    OXFMT_EXT.test(relativePath),
   );
   const eslintFiles = relativePaths.filter((relativePath) =>
     ESLINT_EXT.test(relativePath),
   );
 
-  runBatched(repoRoot, prettierFiles, runPrettier);
+  runBatched(repoRoot, oxfmtFiles, runOxfmt);
   runBatched(repoRoot, eslintFiles, runEslint);
-  runBatched(repoRoot, prettierFiles, runPrettier);
+  runBatched(repoRoot, oxfmtFiles, runOxfmt);
 }
 
 function getCodexEditedPaths(data) {
@@ -414,15 +414,16 @@ function runEslint(repoRoot, files, { report = false } = {}) {
   return output;
 }
 
-function runPrettier(repoRoot, files) {
+function runOxfmt(repoRoot, files) {
   if (files.length === 0) {
     return;
   }
-  const prettierPath = path.join(repoRoot, "node_modules/.bin/prettier");
-  if (!fileExists(prettierPath)) {
+  const oxfmtPath = path.join(repoRoot, "node_modules/.bin/oxfmt");
+  if (!fileExists(oxfmtPath)) {
     return;
   }
-  execFileSync(prettierPath, ["--write", ...files], {
+  // oxfmt writes in place by default.
+  execFileSync(oxfmtPath, [...files], {
     cwd: repoRoot,
     maxBuffer: 50 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
