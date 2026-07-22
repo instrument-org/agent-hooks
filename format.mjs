@@ -67,8 +67,9 @@ function formatDirtyFiles(repoRoot) {
 
   runBatched(repoRoot, oxfmtFiles, runOxfmt);
   runBatched(repoRoot, eslintFiles, runEslint);
+  runBatched(repoRoot, eslintFiles, runOxlint);
 
-  // ESLint fixes can change layout, so finish with oxfmt.
+  // Lint fixes can change layout, so finish with oxfmt.
   runBatched(repoRoot, oxfmtFiles, runOxfmt);
 }
 
@@ -196,6 +197,7 @@ function formatEditedFiles({ cwd, filePaths, repoRoot }) {
 
   runBatched(repoRoot, oxfmtFiles, runOxfmt);
   runBatched(repoRoot, eslintFiles, runEslint);
+  runBatched(repoRoot, eslintFiles, runOxlint);
   runBatched(repoRoot, oxfmtFiles, runOxfmt);
 }
 
@@ -428,6 +430,32 @@ function runOxfmt(repoRoot, files) {
     maxBuffer: 50 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+function runOxlint(repoRoot, files) {
+  if (files.length === 0) {
+    return;
+  }
+  const oxlintPath = path.join(repoRoot, "node_modules/.bin/oxlint");
+  if (!fileExists(oxlintPath)) {
+    return;
+  }
+  // Fast autofix pass: no --type-aware, so it skips tsgolint / TS project
+  // startup while still applying JS-plugin fixes (e.g. tailwindcss class
+  // sort-order) that the eslint pass never covered. Run from repoRoot so
+  // oxlint resolves each file's nearest .oxlintrc.json (per-package config).
+  // oxlint exits non-zero when unfixable problems remain; those surface via
+  // check:lint, so the exit code is ignored here.
+  try {
+    execFileSync(oxlintPath, ["--fix", ...files], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      maxBuffer: 50 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    // Best effort -- remaining problems surface via check:lint.
+  }
 }
 
 function buildLintReason(report) {
