@@ -1,11 +1,22 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const OXFMT_EXT =
   /\.(?:ts|tsx|mjs|cjs|js|jsx|json|jsonc|css|md|mdx|yaml|yml|html)$/i;
 const ESLINT_EXT = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/i;
+
+// Formatted the moment they are written. Prose and stylesheets are deliberately
+// absent and wait for Stop: a turn often makes several edits to one document
+// against remembered content, and reformatting between them invalidates the
+// text the next edit is anchored to. Code earns the immediate pass because the
+// lint fixes at Stop build on already-formatted input.
+const IMMEDIATE_FORMAT_EXT =
+  /\.(?:ts|tsx|mjs|cjs|js|jsx|json|jsonc|yaml|yml|html)$/i;
 
 const INSTRUMENT_ROOT_NAMES = new Set([
   "@instrument-org/monorepo",
@@ -13,69 +24,180 @@ const INSTRUMENT_ROOT_NAMES = new Set([
   "@instrument/internal",
 ]);
 
+const MAX_BUFFER = 50 * 1024 * 1024;
+// Keep argv well under ARG_MAX when a turn touches a lot of files.
+const BATCH_SIZE = 40;
+
+// -------------------------------------------------------------------------
+// Process pool
+//
+// Every pass below costs one tool spawn, and spawn overhead (not linting) is
+// what the hook actually spends its time on. Batches and eslint config groups
+// are therefore dispatched concurrently; this pool is the single place that
+// bounds how many run at once, so callers can use Promise.all freely.
+// -------------------------------------------------------------------------
+
+const MAX_CONCURRENT_PROCESSES = Math.max(
+  2,
+  Math.min(8, os.availableParallelism?.() ?? 4),
+);
+let activeProcesses = 0;
+const waitingForSlot = [];
+
+async function withProcessSlot(run) {
+  if (activeProcesses >= MAX_CONCURRENT_PROCESSES) {
+    await new Promise((resolve) => waitingForSlot.push(resolve));
+  }
+  activeProcesses += 1;
+  try {
+    return await run();
+  } finally {
+    activeProcesses -= 1;
+    waitingForSlot.shift()?.();
+  }
+}
+
+// Tools signal findings with a non-zero exit, so a failure is expected rather
+// than exceptional: return the captured stdout instead of throwing.
+async function execTool(file, arguments_, options) {
+  return withProcessSlot(async () => {
+    try {
+      const { stdout } = await execFileAsync(file, arguments_, {
+        encoding: "utf8",
+        maxBuffer: MAX_BUFFER,
+        ...options,
+      });
+      return { ok: true, stdout: stdout ?? "" };
+    } catch (error) {
+      return {
+        ok: false,
+        stdout: typeof error.stdout === "string" ? error.stdout : "",
+      };
+    }
+  });
+}
+
+async function runBatched(repoRoot, files, run) {
+  if (files.length === 0) {
+    return "";
+  }
+  const batches = [];
+  for (let index = 0; index < files.length; index += BATCH_SIZE) {
+    batches.push(files.slice(index, index + BATCH_SIZE));
+  }
+  const outputs = await Promise.all(
+    batches.map((batch) => run(repoRoot, batch)),
+  );
+  return outputs.filter((output) => typeof output === "string").join("");
+}
+
+// -------------------------------------------------------------------------
+// Paths and repo detection
+// -------------------------------------------------------------------------
+
 function fileExists(filePath) {
   try {
-    if (!fs.statSync(filePath).isFile()) {
-      return false;
-    }
+    return fs.statSync(filePath).isFile();
   } catch {
     return false;
   }
-  return true;
 }
 
-function findEslintConfigDirectory(repoRoot, filePath) {
-  // Walk up from the file's directory to find the nearest eslint.config.*,
-  // stopping at the repo root. ESLint must run from this directory so that
-  // package-level settings (e.g. better-tailwindcss entryPoint) apply.
-  let directory = path.dirname(path.resolve(filePath));
-  const root = path.resolve(repoRoot);
-  while (directory.startsWith(root) && directory !== root) {
-    for (const name of [
-      "eslint.config.ts",
-      "eslint.config.mts",
-      "eslint.config.js",
-      "eslint.config.mjs",
-    ]) {
-      if (fileExists(path.join(directory, name))) {
-        return directory;
-      }
-    }
-    directory = path.dirname(directory);
-  }
-  return root;
+function shouldSkipRelative(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  return (
+    normalized.startsWith("registry/") ||
+    normalized.startsWith("node_modules/") ||
+    normalized.includes("/node_modules/")
+  );
 }
 
-function formatDirtyFiles(repoRoot) {
-  if (!isInstrumentRepoRoot(repoRoot)) {
+function getSafeRelativePath({ filePath, repoRoot }) {
+  const relativePath = path.relative(repoRoot, filePath);
+  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
     return;
   }
-
-  const existing = listDirtyPaths(repoRoot).filter((relativePath) => {
-    if (shouldSkipRelative(relativePath)) {
-      return false;
-    }
-    return fileExists(path.join(repoRoot, relativePath));
-  });
-
-  const oxfmtFiles = existing.filter((relativePath) =>
-    OXFMT_EXT.test(relativePath),
-  );
-  const eslintFiles = existing.filter((relativePath) =>
-    ESLINT_EXT.test(relativePath),
-  );
-
-  runBatched(repoRoot, oxfmtFiles, runOxfmt);
-  runBatched(repoRoot, eslintFiles, runEslint);
-  runBatched(repoRoot, eslintFiles, runOxlint);
-
-  // Lint fixes can change layout, so finish with oxfmt.
-  runBatched(repoRoot, oxfmtFiles, runOxfmt);
+  if (shouldSkipRelative(relativePath)) {
+    return;
+  }
+  return relativePath;
 }
 
-// Per-session record of files this session edited, so the Stop report only
-// blocks on the agent's own work -- never on files a *parallel* agent left
-// dirty in the same repo. Keyed by session id, stored outside the repo.
+// Resolve session-edit absolute paths against one root, dropping anything
+// outside it or since deleted.
+function toExistingRelativePaths({ paths, repoRoot }) {
+  const relativePaths = paths
+    .map((filePath) => getSafeRelativePath({ filePath, repoRoot }))
+    .filter(
+      (relativePath) =>
+        relativePath && fileExists(path.join(repoRoot, relativePath)),
+    );
+  return [...new Set(relativePaths)];
+}
+
+const instrumentRepoRootCache = new Map();
+
+function isInstrumentRepoRoot(repoRoot) {
+  const cached = instrumentRepoRootCache.get(repoRoot);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let isRoot = false;
+  try {
+    const package_ = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+    );
+    isRoot =
+      INSTRUMENT_ROOT_NAMES.has(package_.name) &&
+      fs.existsSync(path.join(repoRoot, ".git"));
+  } catch {
+    isRoot = false;
+  }
+
+  instrumentRepoRootCache.set(repoRoot, isRoot);
+  return isRoot;
+}
+
+async function getRepoRoot(cwd) {
+  const { stdout } = await execTool("git", ["rev-parse", "--show-toplevel"], {
+    cwd,
+  });
+  return stdout.trim() || cwd;
+}
+
+function getStopRoots({ data, repoRoot }) {
+  const workspaceRoots = Array.isArray(data.workspace_roots)
+    ? data.workspace_roots
+        .filter((root) => typeof root === "string" && root.length > 0)
+        .map((root) => path.resolve(root))
+    : [];
+  const roots = workspaceRoots.length > 0 ? workspaceRoots : [repoRoot];
+  const instrumentRoots = roots.filter((root) => isInstrumentRepoRoot(root));
+  if (instrumentRoots.length === 0) {
+    return [];
+  }
+
+  // Only the alphabetically-first root's session runs the sweep, so parallel
+  // sessions in a multi-root workspace do not each repeat it.
+  const primaryRoot = [...instrumentRoots].sort()[0];
+  if (path.resolve(repoRoot) !== primaryRoot) {
+    return [];
+  }
+  return instrumentRoots;
+}
+
+// -------------------------------------------------------------------------
+// Session edit ledger
+//
+// Records what THIS session edited, so both the format sweep and the lint
+// report act only on the agent's own work -- never on files a parallel agent
+// left dirty in the same checkout. Stored outside the repo, keyed by session.
+//
+// Stop consumes the ledger by rotating it, so each turn end processes only the
+// edits made since the previous one rather than replaying the whole session.
+// -------------------------------------------------------------------------
+
 function sessionEditsFile(sessionId) {
   return path.join(os.tmpdir(), "instrument-agent-hooks", `${sessionId}.txt`);
 }
@@ -93,23 +215,42 @@ function recordSessionEdit(sessionId, absolutePath) {
   }
 }
 
-function readSessionEdits(sessionId) {
+function takeSessionEdits(sessionId) {
   if (!sessionId) {
     return [];
   }
+  const active = sessionEditsFile(sessionId);
+  const pending = `${active}.pending`;
+
+  // Rotate first so edits arriving while this turn runs land in a fresh file
+  // and are picked up by the next Stop instead of being dropped.
   try {
-    const content = fs.readFileSync(sessionEditsFile(sessionId), "utf8");
-    return [
-      ...new Set(
-        content
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean),
-      ),
-    ];
+    fs.renameSync(active, pending);
+  } catch {
+    // Nothing new since the last Stop; a leftover .pending from an interrupted
+    // run is still worth draining below.
+  }
+
+  let content = "";
+  try {
+    content = fs.readFileSync(pending, "utf8");
   } catch {
     return [];
   }
+  try {
+    fs.unlinkSync(pending);
+  } catch {
+    // Ignore -- a stale file is re-read harmlessly next turn.
+  }
+
+  return [
+    ...new Set(
+      content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 // Delete session-edit files older than a week so /tmp does not accumulate.
@@ -133,73 +274,205 @@ function pruneSessionEdits() {
   }
 }
 
-function lintReportSessionEdits({ editedPaths, repoRoot }) {
-  if (!isInstrumentRepoRoot(repoRoot)) {
+// -------------------------------------------------------------------------
+// Tool runners
+// -------------------------------------------------------------------------
+
+const eslintConfigDirectoryCache = new Map();
+
+// ESLint flat config does not cascade, so each package's eslint.config.* only
+// applies when ESLint runs from that package directory (e.g. better-tailwindcss
+// entryPoint). Walk up from the file to find the nearest one, stopping at the
+// repo root.
+function findEslintConfigDirectory(repoRoot, filePath) {
+  const startDirectory = path.dirname(path.resolve(filePath));
+  const cached = eslintConfigDirectoryCache.get(startDirectory);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const root = path.resolve(repoRoot);
+  let directory = startDirectory;
+  let found = root;
+  while (directory.startsWith(root) && directory !== root) {
+    const hasConfig = [
+      "eslint.config.ts",
+      "eslint.config.mts",
+      "eslint.config.js",
+      "eslint.config.mjs",
+    ].some((name) => fileExists(path.join(directory, name)));
+    if (hasConfig) {
+      found = directory;
+      break;
+    }
+    directory = path.dirname(directory);
+  }
+
+  eslintConfigDirectoryCache.set(startDirectory, found);
+  return found;
+}
+
+function groupByEslintConfigDirectory(repoRoot, relativePaths) {
+  const groups = new Map();
+  for (const relativePath of relativePaths) {
+    const configDirectory = findEslintConfigDirectory(
+      repoRoot,
+      path.join(repoRoot, relativePath),
+    );
+    if (!groups.has(configDirectory)) {
+      groups.set(configDirectory, []);
+    }
+    groups.get(configDirectory).push(path.resolve(repoRoot, relativePath));
+  }
+  return groups;
+}
+
+// Fixing and reporting are one pass, not two. ESLint no longer builds a
+// TypeScript program (type-aware rules moved to oxlint), so each package's real
+// eslint.config.* is cheap enough to autofix with -- and running it means what
+// --fix leaves behind is exactly what `check:lint` would report, from a single
+// spawn instead of a formatting-config pass plus a reporting pass.
+async function runEslintFix(repoRoot, files, { report = false } = {}) {
+  if (files.length === 0) {
+    return "";
+  }
+  const eslintPath = path.join(repoRoot, "node_modules/.bin/eslint");
+  if (!fileExists(eslintPath)) {
     return "";
   }
 
-  const eslintFiles = [
-    ...new Set(
-      editedPaths
-        .map((absolutePath) => getSafeRelativePath({ filePath: absolutePath, repoRoot }))
-        .filter(
-          (relativePath) =>
-            relativePath &&
-            ESLINT_EXT.test(relativePath) &&
-            fileExists(path.join(repoRoot, relativePath)),
-        ),
-    ),
-  ];
+  // --max-warnings=0 matches `eslint . --max-warnings 0` (check:lint), so
+  // warnings the fixer could not resolve still reach the agent.
+  const reportArguments = report ? ["--max-warnings=0"] : [];
 
-  return runBatched(repoRoot, eslintFiles, (root, batch) =>
-    runEslint(root, batch, { report: true }),
+  const groups = groupByEslintConfigDirectory(repoRoot, files);
+  const outputs = await Promise.all(
+    [...groups].map(async ([configDirectory, absolutePaths]) => {
+      const { ok, stdout } = await execTool(
+        eslintPath,
+        ["--no-ignore", "--fix", ...reportArguments, ...absolutePaths],
+        { cwd: configDirectory },
+      );
+      // ESLint exits non-zero for problems --fix could not resolve; those are
+      // what the Stop branch hands back to the agent.
+      return report && !ok && stdout.trim() ? stdout : "";
+    }),
   );
+  return outputs.join("");
 }
 
-function formatEditedFile({ filePath, repoRoot }) {
-  const relativePath = getSafeRelativePath({ filePath, repoRoot });
-  if (!relativePath || !fileExists(filePath)) {
-    return;
+async function runOxfmt(repoRoot, files) {
+  if (files.length === 0) {
+    return "";
   }
-
-  if (!isInstrumentRepoRoot(repoRoot)) {
-    return;
+  const oxfmtPath = path.join(repoRoot, "node_modules/.bin/oxfmt");
+  if (!fileExists(oxfmtPath)) {
+    return "";
   }
-
-  if (OXFMT_EXT.test(relativePath)) {
-    runOxfmt(repoRoot, [relativePath]);
-  }
+  // oxfmt writes in place by default.
+  await execTool(oxfmtPath, [...files], { cwd: repoRoot });
+  return "";
 }
 
-function formatEditedFiles({ cwd, filePaths, repoRoot }) {
-  const relativePaths = filePaths
-    .map((filePath) =>
-      getSafeRelativePath({
-        filePath: path.resolve(cwd, filePath),
-        repoRoot,
-      }),
-    )
-    .filter(
-      (relativePath) =>
-        relativePath && fileExists(path.join(repoRoot, relativePath)),
-    );
+async function runOxlintFix(repoRoot, files) {
+  if (files.length === 0) {
+    return "";
+  }
+  const oxlintPath = path.join(repoRoot, "node_modules/.bin/oxlint");
+  if (!fileExists(oxlintPath)) {
+    return "";
+  }
+  // No --type-aware, so it skips tsgolint / TS project startup while still
+  // applying JS-plugin fixes (e.g. tailwindcss class sort-order) the eslint
+  // pass never covered. Run from repoRoot so oxlint resolves each file's
+  // nearest .oxlintrc.json. Unfixable problems surface via check:lint.
+  await execTool(oxlintPath, ["--fix", ...files], { cwd: repoRoot });
+  return "";
+}
 
+// -------------------------------------------------------------------------
+// Pipelines
+// -------------------------------------------------------------------------
+
+function snapshotMtimes(repoRoot, relativePaths) {
+  const mtimes = new Map();
+  for (const relativePath of relativePaths) {
+    try {
+      mtimes.set(
+        relativePath,
+        fs.statSync(path.join(repoRoot, relativePath)).mtimeMs,
+      );
+    } catch {
+      // Treat an unreadable file as changed so it still gets a final pass.
+    }
+  }
+  return mtimes;
+}
+
+// Returns whatever ESLint could not fix, when `report` is set.
+async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   if (relativePaths.length === 0 || !isInstrumentRepoRoot(repoRoot)) {
-    return;
+    return "";
   }
 
   const oxfmtFiles = relativePaths.filter((relativePath) =>
     OXFMT_EXT.test(relativePath),
   );
-  const eslintFiles = relativePaths.filter((relativePath) =>
+  const lintFiles = relativePaths.filter((relativePath) =>
     ESLINT_EXT.test(relativePath),
   );
 
-  runBatched(repoRoot, oxfmtFiles, runOxfmt);
-  runBatched(repoRoot, eslintFiles, runEslint);
-  runBatched(repoRoot, eslintFiles, runOxlint);
-  runBatched(repoRoot, oxfmtFiles, runOxfmt);
+  await runBatched(repoRoot, oxfmtFiles, runOxfmt);
+
+  const before = snapshotMtimes(repoRoot, lintFiles);
+  // oxlint first so ESLint reports against the already-fixed content and the
+  // report reflects what actually remains.
+  await runBatched(repoRoot, lintFiles, runOxlintFix);
+  const lintReport = await runBatched(repoRoot, lintFiles, (root, batch) =>
+    runEslintFix(root, batch, { report }),
+  );
+
+  // Lint fixes can change layout, so finish with oxfmt -- but only over the
+  // files a fix actually rewrote.
+  const after = snapshotMtimes(repoRoot, lintFiles);
+  const rewritten = lintFiles.filter(
+    (relativePath) =>
+      OXFMT_EXT.test(relativePath) &&
+      before.get(relativePath) !== after.get(relativePath),
+  );
+  await runBatched(repoRoot, rewritten, runOxfmt);
+
+  return lintReport;
 }
+
+// PostToolUse stays deliberately cheap: a single oxfmt on the one file that
+// changed. Lint autofixes are batched at Stop instead of paid per edit.
+async function formatEditedFile({ filePath, repoRoot }) {
+  const relativePath = getSafeRelativePath({ filePath, repoRoot });
+  if (
+    !relativePath ||
+    !fileExists(filePath) ||
+    !isInstrumentRepoRoot(repoRoot)
+  ) {
+    return;
+  }
+  if (IMMEDIATE_FORMAT_EXT.test(relativePath)) {
+    await runOxfmt(repoRoot, [relativePath]);
+  }
+}
+
+function buildLintReason(report) {
+  const maxLength = 6000;
+  let body = report.trim();
+  if (body.length > maxLength) {
+    body = `${body.slice(0, maxLength)}\n… (truncated)`;
+  }
+  return `ESLint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
+}
+
+// -------------------------------------------------------------------------
+// Event handling
+// -------------------------------------------------------------------------
 
 function getCodexEditedPaths(data) {
   const command =
@@ -216,107 +489,15 @@ function getCodexEditedPaths(data) {
   return [...paths];
 }
 
-function getRepoRoot(cwd) {
-  const root = readGitPaths(cwd, ["rev-parse", "--show-toplevel"]).trim();
-  return root || cwd;
-}
-
-function getSafeRelativePath({ filePath, repoRoot }) {
-  const relativePath = path.relative(repoRoot, filePath);
-  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-    return;
+// Cursor runtime delivers camelCase names; Claude Code delivers PascalCase.
+function normalizeEventName(name) {
+  if (name === "postToolUse") {
+    return "PostToolUse";
   }
-  if (shouldSkipRelative(relativePath)) {
-    return;
+  if (name === "stop") {
+    return "Stop";
   }
-  return relativePath;
-}
-
-function getStopRoots({ data, repoRoot }) {
-  const workspaceRoots = Array.isArray(data.workspace_roots)
-    ? data.workspace_roots
-        .filter((root) => typeof root === "string" && root.length > 0)
-        .map((root) => path.resolve(root))
-    : [];
-  const roots = workspaceRoots.length > 0 ? workspaceRoots : [repoRoot];
-  const instrumentRoots = roots.filter((root) => isInstrumentRepoRoot(root));
-  if (instrumentRoots.length === 0) {
-    return [];
-  }
-
-  const primaryRoot = [...instrumentRoots].sort()[0];
-  if (path.resolve(repoRoot) !== primaryRoot) {
-    return [];
-  }
-  return instrumentRoots;
-}
-
-function isInstrumentRepoRoot(repoRoot) {
-  const packagePath = path.join(repoRoot, "package.json");
-  if (!fs.existsSync(packagePath)) {
-    return false;
-  }
-
-  let package_;
-  try {
-    package_ = JSON.parse(fs.readFileSync(packagePath, "utf8"));
-  } catch {
-    return false;
-  }
-
-  if (!INSTRUMENT_ROOT_NAMES.has(package_.name)) {
-    return false;
-  }
-
-  try {
-    fs.statSync(path.join(repoRoot, ".git"));
-  } catch {
-    return false;
-  }
-
-  return true;
-}
-
-function listDirtyPaths(repoRoot) {
-  const lines = [
-    readGitPaths(repoRoot, [
-      "diff",
-      "--name-only",
-      "--ignore-submodules=all",
-      "HEAD",
-      "--",
-      ":!registry",
-    ]),
-    readGitPaths(repoRoot, [
-      "ls-files",
-      "--others",
-      "--exclude-standard",
-      "--",
-      ":!registry",
-    ]),
-  ];
-
-  const dirty = new Set();
-  for (const line of lines.join("\n").split("\n")) {
-    const relativePath = line.trim();
-    if (relativePath) {
-      dirty.add(relativePath);
-    }
-  }
-  return [...dirty];
-}
-
-function readGitPaths(repoRoot, arguments_) {
-  try {
-    return execFileSync("git", arguments_, {
-      cwd: repoRoot,
-      encoding: "utf8",
-      maxBuffer: 50 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    return typeof error.stdout === "string" ? error.stdout : "";
-  }
+  return name;
 }
 
 function readStdin() {
@@ -329,151 +510,87 @@ function readStdin() {
   });
 }
 
-function runBatched(repoRoot, files, run) {
-  const batchSize = 40;
-  let output = "";
-  for (let index = 0; index < files.length; index += batchSize) {
-    const result = run(repoRoot, files.slice(index, index + batchSize));
-    if (typeof result === "string" && result) {
-      output += result;
+async function handleStop({ data, repoRoot }) {
+  const roots = getStopRoots({ data, repoRoot });
+  if (roots.length === 0) {
+    return "{}";
+  }
+
+  pruneSessionEdits();
+  const editedPaths = takeSessionEdits(data.session_id);
+  if (editedPaths.length === 0) {
+    return "{}";
+  }
+
+  // Claude Code Stop only: hand remaining problems back to the agent so it
+  // fixes them in-context instead of via a manual lint run. Other runtimes
+  // (Codex "stop") do not honor the block contract, so they keep formatting
+  // silently. Skip when stop_hook_active so the agent gets a single fix attempt
+  // (no loops).
+  const shouldReport =
+    data.hook_event_name === "Stop" && data.stop_hook_active !== true;
+
+  let lintReport = "";
+  for (const root of roots) {
+    const relativePaths = toExistingRelativePaths({
+      paths: editedPaths,
+      repoRoot: root,
+    });
+    if (relativePaths.length === 0) {
+      continue;
     }
-  }
-  return output;
-}
-
-function runEslint(repoRoot, files, { report = false } = {}) {
-  if (files.length === 0) {
-    return "";
-  }
-  const eslintPath = path.join(repoRoot, "node_modules/.bin/eslint");
-  if (!fileExists(eslintPath)) {
-    return "";
-  }
-  // The fast autofix pass uses the formatting-only config (no typed rules, so
-  // it skips TypeScript project startup). The Stop reporting pass uses each
-  // package's real eslint.config.* instead, so results match `check:lint`
-  // exactly (no false positives such as react/react-in-jsx-scope, no missed
-  // typed rules).
-  const formatConfigPath = path.join(
-    repoRoot,
-    "packages/eslint-config/format.ts",
-  );
-  const configArguments =
-    !report && fileExists(formatConfigPath)
-      ? ["--config", formatConfigPath]
-      : [];
-  // Reporting mode is read-only and treats warnings as failures, matching
-  // `eslint . --max-warnings 0` (check:lint). The autofix pass keeps --fix.
-  const warningArguments = report ? ["--max-warnings=0"] : [];
-  const fixArguments = report ? [] : ["--fix"];
-
-  // Group files by their nearest eslint.config directory so each group runs
-  // with the correct cwd (and thus the correct package-level config).
-  const groups = new Map();
-  for (const relativePath of files) {
-    const configDirectory = findEslintConfigDirectory(
-      repoRoot,
-      path.join(repoRoot, relativePath),
-    );
-    if (!groups.has(configDirectory)) {
-      groups.set(configDirectory, []);
-    }
-    groups.get(configDirectory).push(path.resolve(repoRoot, relativePath));
+    lintReport += await formatFiles(root, relativePaths, {
+      report: shouldReport,
+    });
   }
 
-  let output = "";
-  for (const [configDirectory, absolutePaths] of groups) {
-    try {
-      execFileSync(
-        eslintPath,
-        [
-          ...configArguments,
-          "--no-ignore",
-          ...warningArguments,
-          ...fixArguments,
-          ...absolutePaths,
-        ],
-        {
-          cwd: configDirectory,
-          encoding: "utf8",
-          maxBuffer: 50 * 1024 * 1024,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
-    } catch (error) {
-      // ESLint exits 1 for problems that --fix could not resolve. In reporting
-      // mode, capture the remaining problems so the Stop branch can surface
-      // them to the agent.
-      if (report) {
-        const remaining =
-          typeof error.stdout === "string" ? error.stdout : "";
-        if (remaining.trim()) {
-          output += remaining;
-        }
-      }
-    }
+  if (!lintReport.trim()) {
+    return "{}";
   }
-  return output;
-}
-
-function runOxfmt(repoRoot, files) {
-  if (files.length === 0) {
-    return;
-  }
-  const oxfmtPath = path.join(repoRoot, "node_modules/.bin/oxfmt");
-  if (!fileExists(oxfmtPath)) {
-    return;
-  }
-  // oxfmt writes in place by default.
-  execFileSync(oxfmtPath, [...files], {
-    cwd: repoRoot,
-    maxBuffer: 50 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
+  return JSON.stringify({
+    decision: "block",
+    reason: buildLintReason(lintReport),
   });
 }
 
-function runOxlint(repoRoot, files) {
-  if (files.length === 0) {
+async function handleEdit({ cwd, data, eventName, repoRoot }) {
+  if (
+    eventName === "afterFileEdit" &&
+    typeof data.file_path === "string" &&
+    data.file_path.length > 0
+  ) {
+    const filePath = path.resolve(data.file_path);
+    await formatEditedFile({ filePath, repoRoot });
+    recordSessionEdit(data.session_id, filePath);
     return;
   }
-  const oxlintPath = path.join(repoRoot, "node_modules/.bin/oxlint");
-  if (!fileExists(oxlintPath)) {
+
+  if (eventName !== "PostToolUse") {
     return;
   }
-  // Fast autofix pass: no --type-aware, so it skips tsgolint / TS project
-  // startup while still applying JS-plugin fixes (e.g. tailwindcss class
-  // sort-order) that the eslint pass never covered. Run from repoRoot so
-  // oxlint resolves each file's nearest .oxlintrc.json (per-package config).
-  // oxlint exits non-zero when unfixable problems remain; those surface via
-  // check:lint, so the exit code is ignored here.
-  try {
-    execFileSync(oxlintPath, ["--fix", ...files], {
-      cwd: repoRoot,
-      encoding: "utf8",
-      maxBuffer: 50 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch {
-    // Best effort -- remaining problems surface via check:lint.
-  }
-}
 
-function buildLintReason(report) {
-  const maxLength = 6000;
-  let body = report.trim();
-  if (body.length > maxLength) {
-    body = `${body.slice(0, maxLength)}\n… (truncated)`;
+  if (data.tool_name === "apply_patch") {
+    const filePaths = getCodexEditedPaths(data).map((filePath) =>
+      path.resolve(cwd, filePath),
+    );
+    await Promise.all(
+      filePaths.map((filePath) => formatEditedFile({ filePath, repoRoot })),
+    );
+    for (const filePath of filePaths) {
+      recordSessionEdit(data.session_id, filePath);
+    }
+    return;
   }
-  return `ESLint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
-}
 
-function shouldSkipRelative(relativePath) {
-  const normalized = relativePath.replaceAll("\\", "/");
-  return (
-    normalized.startsWith("registry/") ||
-    normalized.startsWith("node_modules/") ||
-    normalized.includes("/node_modules/")
-  );
+  if (
+    (data.tool_name === "Edit" || data.tool_name === "Write") &&
+    typeof data.tool_input?.file_path === "string" &&
+    data.tool_input.file_path.length > 0
+  ) {
+    const filePath = path.resolve(data.tool_input.file_path);
+    await formatEditedFile({ filePath, repoRoot });
+    recordSessionEdit(data.session_id, filePath);
+  }
 }
 
 const raw = await readStdin();
@@ -490,81 +607,13 @@ try {
 let result = "{}";
 try {
   const cwd = process.cwd();
-  const repoRoot = getRepoRoot(cwd);
-
-  // Cursor runtime delivers camelCase names; Claude Code delivers PascalCase.
-  // Normalize to PascalCase so the branches below work for both runtimes.
-  const eventName = (() => {
-    const n = data.hook_event_name;
-    if (n === "postToolUse") {
-      return "PostToolUse";
-    }
-    if (n === "stop") {
-      return "Stop";
-    }
-    return n;
-  })();
-
-  if (
-    eventName === "afterFileEdit" &&
-    typeof data.file_path === "string" &&
-    data.file_path.length > 0
-  ) {
-    const filePath = path.resolve(data.file_path);
-    formatEditedFile({ filePath, repoRoot });
-    recordSessionEdit(data.session_id, filePath);
-  }
+  const repoRoot = await getRepoRoot(cwd);
+  const eventName = normalizeEventName(data.hook_event_name);
 
   if (eventName === "Stop") {
-    const roots = getStopRoots({ data, repoRoot });
-    for (const root of roots) {
-      formatDirtyFiles(root);
-    }
-
-    // Claude Code Stop only: run each package's real ESLint config over the
-    // files THIS session edited and hand any remaining problems back to the
-    // agent so it fixes them in-context instead of via a manual lint run. We
-    // scope to the session's own edits (not the whole dirty set) so a parallel
-    // agent's in-flight files never block this one. The format pass above uses
-    // a fast formatting-only config for autofixes; reporting uses the real
-    // config so results match `check:lint`. Other runtimes (Codex "stop") do
-    // not honor the block contract, so they keep formatting silently. Skip when
-    // stop_hook_active so the agent gets a single fix attempt (no loops).
-    if (data.hook_event_name === "Stop" && data.stop_hook_active !== true) {
-      pruneSessionEdits();
-      const editedPaths = readSessionEdits(data.session_id);
-      if (editedPaths.length > 0) {
-        let lintReport = "";
-        for (const root of roots) {
-          lintReport += lintReportSessionEdits({ editedPaths, repoRoot: root });
-        }
-        if (lintReport.trim()) {
-          result = JSON.stringify({
-            decision: "block",
-            reason: buildLintReason(lintReport),
-          });
-        }
-      }
-    }
-  }
-
-  if (eventName === "PostToolUse" && data.tool_name === "apply_patch") {
-    const filePaths = getCodexEditedPaths(data);
-    formatEditedFiles({ cwd, filePaths, repoRoot });
-    for (const filePath of filePaths) {
-      recordSessionEdit(data.session_id, path.resolve(cwd, filePath));
-    }
-  }
-
-  if (
-    eventName === "PostToolUse" &&
-    (data.tool_name === "Edit" || data.tool_name === "Write") &&
-    typeof data.tool_input?.file_path === "string" &&
-    data.tool_input.file_path.length > 0
-  ) {
-    const filePath = path.resolve(data.tool_input.file_path);
-    formatEditedFile({ filePath, repoRoot });
-    recordSessionEdit(data.session_id, filePath);
+    result = await handleStop({ data, repoRoot });
+  } else {
+    await handleEdit({ cwd, data, eventName, repoRoot });
   }
 } catch (error) {
   console.error("[format-hook]", error?.message ?? error);
