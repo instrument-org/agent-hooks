@@ -18,10 +18,7 @@ node "$(git rev-parse --show-toplevel)/node_modules/@instrument-org/agent-hooks/
 
 ## Verifying a change
 
-Both scripts run against a real consuming repo (one with `node_modules`
-installed) and confine their fixtures to a temp directory inside it, removed on
-exit. Neither touches anything else, which matters because a consuming repo
-usually has work in progress.
+Both scripts run against a real consuming repo (one with `node_modules` installed) and confine their fixtures to a temp directory inside it, removed on exit. Neither touches anything else, which matters because a consuming repo usually has work in progress.
 
 ```sh
 # 13 behavioural assertions: what formats when, what is left alone,
@@ -32,9 +29,7 @@ node scripts/smoke.mjs <path-to-consuming-repo>
 node scripts/bench.mjs <path-to-consuming-repo> --packages 3 --baseline HEAD~1
 ```
 
-Read `docs/findings/hook-performance.md` before taking a timing by hand. A cold
-config cache inflates results roughly tenfold, and there are a few other traps
-that produce confidently wrong numbers.
+Read `docs/findings/hook-performance.md` before taking a timing by hand. A cold config cache inflates results roughly tenfold, and there are a few other traps that produce confidently wrong numbers.
 
 ## Docs
 
