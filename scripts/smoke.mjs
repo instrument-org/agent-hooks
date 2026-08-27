@@ -20,7 +20,7 @@ const HOOK_TIMEOUT_MS = 120_000;
 
 const UNFORMATTED_TS = "export const v = {b:1,a:2}\n";
 const RAW_MARKDOWN = "# Title\n\n\n\nSome   text   \n";
-const MISSPELLED_MARKDOWN = "A colour that is travelling.\n";
+const MISSPELLED_MARKDOWN = "We recieve teh result.\n";
 
 function parseArguments(argv) {
   const positional = [];
@@ -227,9 +227,13 @@ async function main() {
         stop_hook_active: false,
       },
     });
+    // Plain transpositions rather than British spellings, so this holds in any
+    // consuming repo: locale corrections are allowlistable per repo and one of
+    // them allows `colour` outright, for a library that spells its options that
+    // way.
     check(
       "misspellings are corrected at Stop",
-      read(proseFile).includes("color") && read(proseFile).includes("traveling"),
+      read(proseFile) === "We receive the result.\n",
       `got: ${read(proseFile).trim()}`,
     );
 
