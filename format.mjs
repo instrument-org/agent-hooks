@@ -390,6 +390,68 @@ async function runOxlintFix(repoRoot, files) {
   return "";
 }
 
+// The consuming repo's scripts/typos.ts vendors a pinned, checksum-verified
+// binary into node_modules/.cache and forwards arguments to it. Going back
+// through that script costs ~65ms of node startup per spawn, so prefer the
+// binary it already cached and keep the script as the cold path that puts it
+// there. Newest directory wins: a TYPOS_VERSION bump leaves the previous
+// version's directory behind, and running the stale one would spell-check
+// against an outdated corrections corpus.
+function findTyposBinary(repoRoot) {
+  const cacheDirectory = path.join(repoRoot, "node_modules/.cache/typos");
+  const binaryName = process.platform === "win32" ? "typos.exe" : "typos";
+  let newest;
+  let newestMtime = -1;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(cacheDirectory);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const candidate = path.join(cacheDirectory, entry, binaryName);
+    if (!fileExists(candidate)) {
+      continue;
+    }
+    const { mtimeMs } = fs.statSync(candidate);
+    if (mtimeMs > newestMtime) {
+      newest = candidate;
+      newestMtime = mtimeMs;
+    }
+  }
+  return newest;
+}
+
+async function runTypos(repoRoot, files) {
+  if (files.length === 0) {
+    return "";
+  }
+  // Repos without the runner skip the pass, like every other tool above.
+  const runnerPath = path.join(repoRoot, "scripts/typos.ts");
+  if (!fileExists(runnerPath)) {
+    return "";
+  }
+  const binary = findTyposBinary(repoRoot);
+  // --force-exclude is load-bearing. typos applies a slash-anchored
+  // extend-exclude only while walking a directory itself, never to a path
+  // handed to it, and the files excluded that way are excluded because their
+  // misspellings ARE the content -- a British-English eval fixture, a document
+  // quoting the spellings it is about. Without this flag a turn that edits one
+  // silently corrects the thing it is demonstrating. What typos cannot correct
+  // unambiguously it leaves alone, and that surfaces in the CI spelling step.
+  await execTool(
+    binary ?? process.execPath,
+    [
+      ...(binary ? [] : [runnerPath]),
+      "--write-changes",
+      "--force-exclude",
+      ...files,
+    ],
+    { cwd: repoRoot },
+  );
+  return "";
+}
+
 // -------------------------------------------------------------------------
 // Pipelines
 // -------------------------------------------------------------------------
@@ -414,6 +476,12 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   if (relativePaths.length === 0 || !isInstrumentRepoRoot(repoRoot)) {
     return "";
   }
+
+  // Spelling first, so every pass below sees corrected text. Unfiltered by
+  // extension on purpose: typos reads prose, shell scripts, and TOML as
+  // readily as it reads code, and typos.toml is the one place that decides
+  // what is in scope.
+  await runBatched(repoRoot, relativePaths, runTypos);
 
   const oxfmtFiles = relativePaths.filter((relativePath) =>
     OXFMT_EXT.test(relativePath),

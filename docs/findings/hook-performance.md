@@ -9,10 +9,14 @@ Per-spawn, single file:
 | Pass                                    | Warm  | Cold    |
 | --------------------------------------- | ----- | ------- |
 | node startup                            | 60ms  |         |
+| `typos --write-changes` (binary)        | 14ms  |         |
+| `typos` via `scripts/typos.ts`          | 79ms  |         |
 | `oxfmt`                                 | 155ms |         |
 | `oxlint --fix`                          | 514ms |         |
 | `eslint --fix` (formatting-only config) | 766ms |         |
 | `eslint` report (real config)           | 160ms | 1,600ms |
+
+The two typos rows are the same work either side of a node startup, and are why the spelling pass runs the cached binary directly instead of the script that vendors it. The script stays as the cold path, since something has to fetch the binary the first time.
 
 Linting a file is a rounding error next to starting the tool that lints it. ESLint on ten files costs about the same as on one; going to thirty adds roughly 30ms per file on top of a fixed startup. So the lever is **spawn count**, not file count, and the two ways to pull it are running fewer passes and running independent ones concurrently.
 
@@ -28,6 +32,8 @@ Turn-end cost, before and after those changes:
 | 1 package edited             | 4.4s       | 2.0s  |
 | 3 packages edited            | 6.3s       | 2.2s  |
 | No new edits since last turn | full sweep | 75ms  |
+
+Adding the spelling pass put roughly 136ms back on a warm three-package turn, measured as a median over four runs against the preceding commit. That is the one pass whose cost is a fixed spawn rather than a function of what changed, so it is the floor a turn cannot go below once it has any edits at all.
 
 ## The cold cache is a factor of ten, and installs reset it
 

@@ -20,6 +20,7 @@ const HOOK_TIMEOUT_MS = 120_000;
 
 const UNFORMATTED_TS = "export const v = {b:1,a:2}\n";
 const RAW_MARKDOWN = "# Title\n\n\n\nSome   text   \n";
+const MISSPELLED_MARKDOWN = "A colour that is travelling.\n";
 
 function parseArguments(argv) {
   const positional = [];
@@ -211,6 +212,40 @@ async function main() {
       "prose formatted at Stop",
       read(docFile) !== RAW_MARKDOWN,
       "markdown never got formatted",
+    );
+
+    console.log("\nSpelling");
+    const spellSession = session("spell");
+    const proseFile = fixture("prose.md", MISSPELLED_MARKDOWN);
+    seedLedger(spellSession, [proseFile]);
+    await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: spellSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "misspellings are corrected at Stop",
+      read(proseFile).includes("color") && read(proseFile).includes("traveling"),
+      `got: ${read(proseFile).trim()}`,
+    );
+
+    // Asserted against the source rather than by behavior, which is a weaker
+    // test than the rest of this file and deliberately so. typos honors
+    // extend-exclude for an explicitly-passed path only under --force-exclude,
+    // and only for the slash-anchored patterns; a bare filename is honored
+    // either way. Every slash-anchored exclude in a consuming repo names a real
+    // tracked file, so a behavioral version of this check would have to hand
+    // the hook one of them -- and would corrupt it in the exact case it exists
+    // to catch. The flag's effect is verified by hand against those paths; what
+    // is worth guarding here is that nobody quietly drops it.
+    check(
+      "the spelling pass passes --force-exclude",
+      fs.readFileSync(hook, "utf8").includes('"--force-exclude"'),
+      "typos would rewrite files whose misspellings are the content",
     );
 
     // The guarantee that matters most: a turn must never rewrite files it did

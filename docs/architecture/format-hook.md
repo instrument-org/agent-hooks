@@ -33,12 +33,15 @@ Files older than a week are pruned on each `Stop`.
 
 At `Stop`, for the files this turn edited:
 
-1. `oxfmt` over everything formattable
-2. `oxlint --fix` over the lintable subset
-3. `eslint --fix` (plus `--max-warnings=0` when reporting) over the same subset
-4. `oxfmt` again, but only over files a fixer actually rewrote
+1. `typos --write-changes` over every edited file, whatever its type
+2. `oxfmt` over everything formattable
+3. `oxlint --fix` over the lintable subset
+4. `eslint --fix` (plus `--max-warnings=0` when reporting) over the same subset
+5. `oxfmt` again, but only over files a fixer actually rewrote
 
-The order matters. oxlint runs before ESLint so the report reflects content oxlint has already fixed. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
+The order matters. typos runs first so everything after it formats corrected text. oxlint runs before ESLint so the report reflects content oxlint has already fixed. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
+
+The spelling pass goes through the consuming repo's own `scripts/typos.ts`, which vendors the pinned checksum-verified binary, so a repo without that script skips the pass. It passes `--force-exclude`, without which typos would ignore `typos.toml`'s `extend-exclude` for the paths handed to it: the files excluded there are excluded because their misspellings are the content, and correcting one erases what it documents.
 
 ESLint fixes and reports in one spawn. Type-aware rules moved to oxlint, so ESLint no longer builds a TypeScript program and each package's real config is cheap enough to autofix with. Running the real config also means what `--fix` leaves behind is exactly what `check:lint` would report, with no second pass and no divergence between the two.
 
