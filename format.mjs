@@ -348,9 +348,15 @@ async function runEslintFix(repoRoot, files, { report = false } = {}) {
   const groups = groupByEslintConfigDirectory(repoRoot, files);
   const outputs = await Promise.all(
     [...groups].map(async ([configDirectory, absolutePaths]) => {
+      // A config's ignores are part of what it says, and naming a file on the
+      // command line is not a reason to overrule them: a repo that ignores
+      // vendored or generated code means the agent editing one should hear
+      // nothing about it, the same silence `check:lint` gives. Without
+      // --no-warn-ignored, ESLint answers a named ignored file with a warning
+      // about ignoring it, which --max-warnings=0 then hands back as work.
       const { ok, stdout } = await execTool(
         eslintPath,
-        ["--no-ignore", "--fix", ...reportArguments, ...absolutePaths],
+        ["--no-warn-ignored", "--fix", ...reportArguments, ...absolutePaths],
         { cwd: configDirectory },
       );
       // ESLint exits non-zero for problems --fix could not resolve; those are
