@@ -18,7 +18,9 @@ import path from "node:path";
 const FIXTURE_DIR = ".agent-hooks-smoke";
 const HOOK_TIMEOUT_MS = 120_000;
 
-const UNFORMATTED_TS = "export const v = {b:1,a:2}\n";
+// The spread is unicorn/no-useless-spread, an oxlint autofix that formatting
+// alone never applies.
+const UNFORMATTED_TS = "export const v = [...[1,2]]\n";
 const RAW_MARKDOWN = "# Title\n\n\n\nSome   text   \n";
 const MISSPELLED_MARKDOWN = "We recieve teh result.\n";
 
@@ -166,12 +168,12 @@ async function main() {
     });
     check(
       "code is oxfmt-formatted on edit",
-      read(codeFile).includes("{ b: 1, a: 2 }"),
+      read(codeFile).includes("[...[1, 2]]"),
       `got: ${read(codeFile).trim()}`,
     );
     check(
       "lint fixes are NOT applied on edit (deferred to Stop)",
-      !read(codeFile).includes("{ a: 2, b: 1 }"),
+      read(codeFile).includes("..."),
       `got: ${read(codeFile).trim()}`,
     );
 
@@ -205,7 +207,7 @@ async function main() {
     });
     check(
       "lint fixes applied at Stop",
-      read(codeFile).includes("{ a: 2, b: 1 }"),
+      read(codeFile).includes("v = [1, 2]"),
       `got: ${read(codeFile).trim()}`,
     );
     check(
@@ -292,14 +294,11 @@ async function main() {
 
     console.log("\nReport");
     const blockSession = session("block");
-    // no-console and no-debugger are enforced and have no fixer, so --fix
-    // leaves them behind. Do not reach for no-explicit-any or no-unused-vars
-    // here: the type-aware rules moved to oxlint and ESLint no longer reports
-    // them, which reads as "blocking is broken" when it is the fixture at fault.
-    const badFile = fixture(
-      "bad.ts",
-      'export function f() {\n  console.log("x");\n  debugger;\n}\n',
-    );
+    // A duplicate key is in oxlint's correctness category and has no fixer, so
+    // --fix leaves it behind. Avoid a type-aware rule here: the fixture sits
+    // outside every tsconfig project, so type information may not reach it,
+    // which reads as "blocking is broken" when it is the fixture at fault.
+    const badFile = fixture("bad.ts", "export const o = { a: 1, a: 2 };\n");
     seedLedger(blockSession, [badFile]);
     const blocked = await runHook({
       cwd: repoRoot,

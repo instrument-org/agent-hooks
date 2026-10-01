@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const OXFMT_EXT =
   /\.(?:ts|tsx|mjs|cjs|js|jsx|json|jsonc|css|md|mdx|yaml|yml|html)$/i;
-const ESLINT_EXT = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/i;
+const LINT_EXT = /\.(?:ts|tsx|mjs|cjs|js|jsx)$/i;
 
 // Formatted the moment they are written. Prose and stylesheets are deliberately
 // absent and wait for Stop: a turn often makes several edits to one document
@@ -32,8 +32,8 @@ const BATCH_SIZE = 40;
 // Process pool
 //
 // Every pass below costs one tool spawn, and spawn overhead (not linting) is
-// what the hook actually spends its time on. Batches and eslint config groups
-// are therefore dispatched concurrently; this pool is the single place that
+// what the hook actually spends its time on. Batches are therefore dispatched
+// concurrently; this pool is the single place that
 // bounds how many run at once, so callers can use Promise.all freely.
 // -------------------------------------------------------------------------
 
@@ -278,95 +278,6 @@ function pruneSessionEdits() {
 // Tool runners
 // -------------------------------------------------------------------------
 
-const eslintConfigDirectoryCache = new Map();
-
-// ESLint flat config does not cascade, so each package's eslint.config.* only
-// applies when ESLint runs from that package directory (e.g. better-tailwindcss
-// entryPoint). Walk up from the file to find the nearest one, stopping at the
-// repo root.
-function findEslintConfigDirectory(repoRoot, filePath) {
-  const startDirectory = path.dirname(path.resolve(filePath));
-  const cached = eslintConfigDirectoryCache.get(startDirectory);
-  if (cached !== undefined) {
-    return cached;
-  }
-
-  const root = path.resolve(repoRoot);
-  let directory = startDirectory;
-  let found = root;
-  while (directory.startsWith(root) && directory !== root) {
-    const hasConfig = [
-      "eslint.config.ts",
-      "eslint.config.mts",
-      "eslint.config.js",
-      "eslint.config.mjs",
-    ].some((name) => fileExists(path.join(directory, name)));
-    if (hasConfig) {
-      found = directory;
-      break;
-    }
-    directory = path.dirname(directory);
-  }
-
-  eslintConfigDirectoryCache.set(startDirectory, found);
-  return found;
-}
-
-function groupByEslintConfigDirectory(repoRoot, relativePaths) {
-  const groups = new Map();
-  for (const relativePath of relativePaths) {
-    const configDirectory = findEslintConfigDirectory(
-      repoRoot,
-      path.join(repoRoot, relativePath),
-    );
-    if (!groups.has(configDirectory)) {
-      groups.set(configDirectory, []);
-    }
-    groups.get(configDirectory).push(path.resolve(repoRoot, relativePath));
-  }
-  return groups;
-}
-
-// Fixing and reporting are one pass, not two. ESLint no longer builds a
-// TypeScript program (type-aware rules moved to oxlint), so each package's real
-// eslint.config.* is cheap enough to autofix with -- and running it means what
-// --fix leaves behind is exactly what `check:lint` would report, from a single
-// spawn instead of a formatting-config pass plus a reporting pass.
-async function runEslintFix(repoRoot, files, { report = false } = {}) {
-  if (files.length === 0) {
-    return "";
-  }
-  const eslintPath = path.join(repoRoot, "node_modules/.bin/eslint");
-  if (!fileExists(eslintPath)) {
-    return "";
-  }
-
-  // --max-warnings=0 matches `eslint . --max-warnings 0` (check:lint), so
-  // warnings the fixer could not resolve still reach the agent.
-  const reportArguments = report ? ["--max-warnings=0"] : [];
-
-  const groups = groupByEslintConfigDirectory(repoRoot, files);
-  const outputs = await Promise.all(
-    [...groups].map(async ([configDirectory, absolutePaths]) => {
-      // A config's ignores are part of what it says, and naming a file on the
-      // command line is not a reason to overrule them: a repo that ignores
-      // vendored or generated code means the agent editing one should hear
-      // nothing about it, the same silence `check:lint` gives. Without
-      // --no-warn-ignored, ESLint answers a named ignored file with a warning
-      // about ignoring it, which --max-warnings=0 then hands back as work.
-      const { ok, stdout } = await execTool(
-        eslintPath,
-        ["--no-warn-ignored", "--fix", ...reportArguments, ...absolutePaths],
-        { cwd: configDirectory },
-      );
-      // ESLint exits non-zero for problems --fix could not resolve; those are
-      // what the Stop branch hands back to the agent.
-      return report && !ok && stdout.trim() ? stdout : "";
-    }),
-  );
-  return outputs.join("");
-}
-
 async function runOxfmt(repoRoot, files) {
   if (files.length === 0) {
     return "";
@@ -380,7 +291,13 @@ async function runOxfmt(repoRoot, files) {
   return "";
 }
 
-async function runOxlintFix(repoRoot, files) {
+// Fixing and reporting are one pass. Run from repoRoot, oxlint resolves each
+// file's nearest .oxlintrc.json, so one spawn covers every package a turn
+// touched, and what --fix leaves behind is exactly what `check:lint` would
+// report. Only the reporting pass asks for type information and silences
+// warnings: a type-aware run is the slow part, and a warning is advice rather
+// than something to block a turn on.
+async function runOxlint(repoRoot, files, { report = false } = {}) {
   if (files.length === 0) {
     return "";
   }
@@ -388,12 +305,23 @@ async function runOxlintFix(repoRoot, files) {
   if (!fileExists(oxlintPath)) {
     return "";
   }
-  // No --type-aware, so it skips tsgolint / TS project startup while still
-  // applying JS-plugin fixes (e.g. tailwindcss class sort-order) the eslint
-  // pass never covered. Run from repoRoot so oxlint resolves each file's
-  // nearest .oxlintrc.json. Unfixable problems surface via check:lint.
-  await execTool(oxlintPath, ["--fix", ...files], { cwd: repoRoot });
-  return "";
+  // A config's ignores are part of what it says, and naming a file on the
+  // command line is not a reason to overrule them: a repo that ignores vendored
+  // or generated code means the agent editing one should hear nothing about
+  // it, the same silence `check:lint` gives. Without
+  // --no-error-on-unmatched-pattern, oxlint answers a batch made only of
+  // ignored files with an error, which the report would hand back as work.
+  const { ok, stdout } = await execTool(
+    oxlintPath,
+    [
+      "--fix",
+      "--no-error-on-unmatched-pattern",
+      ...(report ? ["--type-aware", "--quiet"] : []),
+      ...files,
+    ],
+    { cwd: repoRoot },
+  );
+  return report && !ok && stdout.trim() ? stdout : "";
 }
 
 // The consuming repo's scripts/typos.ts vendors a pinned, checksum-verified
@@ -477,7 +405,7 @@ function snapshotMtimes(repoRoot, relativePaths) {
   return mtimes;
 }
 
-// Returns whatever ESLint could not fix, when `report` is set.
+// Returns whatever oxlint could not fix, when `report` is set.
 async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   if (relativePaths.length === 0 || !isInstrumentRepoRoot(repoRoot)) {
     return "";
@@ -493,17 +421,14 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
     OXFMT_EXT.test(relativePath),
   );
   const lintFiles = relativePaths.filter((relativePath) =>
-    ESLINT_EXT.test(relativePath),
+    LINT_EXT.test(relativePath),
   );
 
   await runBatched(repoRoot, oxfmtFiles, runOxfmt);
 
   const before = snapshotMtimes(repoRoot, lintFiles);
-  // oxlint first so ESLint reports against the already-fixed content and the
-  // report reflects what actually remains.
-  await runBatched(repoRoot, lintFiles, runOxlintFix);
   const lintReport = await runBatched(repoRoot, lintFiles, (root, batch) =>
-    runEslintFix(root, batch, { report }),
+    runOxlint(root, batch, { report }),
   );
 
   // Lint fixes can change layout, so finish with oxfmt -- but only over the
@@ -541,7 +466,7 @@ function buildLintReason(report) {
   if (body.length > maxLength) {
     body = `${body.slice(0, maxLength)}\n… (truncated)`;
   }
-  return `ESLint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
+  return `oxlint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
 }
 
 // -------------------------------------------------------------------------

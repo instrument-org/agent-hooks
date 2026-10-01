@@ -7,11 +7,11 @@
 //     --runs <n>       timed runs after the warm-up (default 4)
 //     --baseline <ref> also time format.mjs from a git ref and compare
 //
-// Reports the first run separately from the rest on purpose. ESLint compiles
-// each package's TypeScript flat config through jiti and caches the result in
-// node_modules/.cache/jiti, so a cold cache costs roughly ten times a warm one
-// and pnpm install wipes it. Quoting a cold number as "the" cost, or a warm one
-// while ignoring that every install pays the cold price again, both mislead.
+// Reports the first run separately from the rest on purpose. A cold run pays
+// for disk caches and tsgolint's first program build that later runs do not,
+// and pnpm install resets them. Quoting a cold number as "the" cost, or a warm
+// one while ignoring that every install pays the cold price again, both
+// mislead.
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -60,9 +60,9 @@ function run(command, commandArguments, { cwd, input } = {}) {
   });
 }
 
-// Each directory holding its own eslint.config.* is a separate ESLint spawn,
-// because flat config does not cascade. Spreading fixtures across them is what
-// exercises the concurrent path.
+// Each package directory is a separate TypeScript project for the type-aware
+// pass. Spreading fixtures across them is what exercises a turn that touched
+// several packages.
 function findPackageDirectories(repoRoot) {
   const found = [];
   const walk = (directory, depth) => {
@@ -76,7 +76,7 @@ function findPackageDirectories(repoRoot) {
       return;
     }
     const hasConfig = entries.some(
-      (entry) => entry.isFile() && entry.name.startsWith("eslint.config."),
+      (entry) => entry.isFile() && entry.name === "tsconfig.json",
     );
     if (hasConfig && directory !== repoRoot) {
       found.push(directory);
@@ -152,7 +152,7 @@ async function main() {
   const packageDirectories = findPackageDirectories(repoRoot);
   if (packageDirectories.length === 0) {
     console.error(
-      `no packages with an eslint.config.* found under ${repoRoot}`,
+      `no packages with a tsconfig.json found under ${repoRoot}`,
     );
     process.exit(2);
   }

@@ -4,7 +4,7 @@
 
 ## Why it exists
 
-The repos enforce a set of pedantic-but-mechanical rules: import and object key ordering, Tailwind class order, formatting. An agent writing code cannot reliably satisfy those while also solving the actual problem, and asking it to would burn a fix-lint-fix cycle on every file. The hook applies them instead, so the agent instruction can be "don't hand-format, expect files to change after you write them" rather than "hand-sort everything correctly".
+The repos enforce a few mechanical rules: formatting, Tailwind class order, and whatever else oxlint can autofix. An agent writing code cannot reliably satisfy those while also solving the actual problem, and asking it to would burn a fix-lint-fix cycle on every file. The hook applies them instead, so the agent instruction can be "don't hand-format, expect files to change after you write them". What it cannot fix it hands back in the same turn, so the agent never has to run lint by hand to find it.
 
 That instruction is only true because the hook runs. If the hook stops working, the guidance in the consuming repos becomes actively wrong.
 
@@ -35,15 +35,14 @@ At `Stop`, for the files this turn edited:
 
 1. `typos --write-changes` over every edited file, whatever its type
 2. `oxfmt` over everything formattable
-3. `oxlint --fix` over the lintable subset
-4. `eslint --fix` (plus `--max-warnings=0` when reporting) over the same subset
-5. `oxfmt` again, but only over files a fixer actually rewrote
+3. `oxlint --fix` over the lintable subset, plus `--type-aware --quiet` when reporting
+4. `oxfmt` again, but only over files a fixer actually rewrote
 
-The order matters. typos runs first so everything after it formats corrected text. oxlint runs before ESLint so the report reflects content oxlint has already fixed. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
+The order matters. typos runs first so everything after it formats corrected text. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
 
 The spelling pass goes through the consuming repo's own `scripts/typos.ts`, which vendors the pinned checksum-verified binary, so a repo without that script skips the pass. It passes `--force-exclude`, without which typos would ignore `typos.toml`'s `extend-exclude` for the paths handed to it: the files excluded there are excluded because their misspellings are the content, and correcting one erases what it documents.
 
-ESLint fixes and reports in one spawn. Type-aware rules moved to oxlint, so ESLint no longer builds a TypeScript program and each package's real config is cheap enough to autofix with. Running the real config also means what `--fix` leaves behind is exactly what `check:lint` would report, with no second pass and no divergence between the two.
+oxlint fixes and reports in one spawn from the repo root, where it resolves each file's nearest `.oxlintrc.json`, so a turn that touched three packages still costs one process. What `--fix` leaves behind is exactly what `check:lint` would report. The report includes type-aware rules, which cost about 1.5s for a turn's worth of files, and leaves out warnings, which are advice rather than something to block a turn on. `--no-error-on-unmatched-pattern` keeps a batch made only of ignored files quiet instead of reporting "no files found" as a problem.
 
 ## Which files get formatted when
 
@@ -53,7 +52,7 @@ ESLint fixes and reports in one spawn. Type-aware rules moved to oxlint, so ESLi
 
 ## Process pool
 
-Cost is dominated by process spawns, not by linting. ESLint flat config does not cascade, so each directory with its own `eslint.config.*` needs its own spawn with that directory as cwd. Those spawns, and the batches within them, are dispatched concurrently through a pool bounded at `min(8, cores)`. The pool is the only place concurrency is limited, so callers can use `Promise.all` freely.
+Cost is dominated by process spawns and, for the report, by tsgolint building each touched package's TypeScript program. Batches are dispatched concurrently through a pool bounded at `min(8, cores)`. The pool is the only place concurrency is limited, so callers can use `Promise.all` freely.
 
 Batches are capped at 40 files to keep argv under `ARG_MAX`.
 

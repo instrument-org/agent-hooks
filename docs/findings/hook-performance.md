@@ -1,6 +1,6 @@
 # Where the format hook spends its time
 
-Measured 2026-07-25 against the `instrument` monorepo, Apple silicon, warm caches unless noted.
+Measured 2026-07-25 against the `instrument` monorepo, Apple silicon, warm caches unless noted. The hook does not run the ESLint passes in these tables; the spawn-count lesson applies to oxlint the same way.
 
 ## The cost is process spawns, not linting
 
