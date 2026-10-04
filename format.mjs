@@ -123,16 +123,66 @@ function getSafeRelativePath({ filePath, repoRoot }) {
   return relativePath;
 }
 
-// Resolve session-edit absolute paths against one root, dropping anything
-// outside it or since deleted.
-function toExistingRelativePaths({ paths, repoRoot }) {
-  const relativePaths = paths
-    .map((filePath) => getSafeRelativePath({ filePath, repoRoot }))
-    .filter(
-      (relativePath) =>
-        relativePath && fileExists(path.join(repoRoot, relativePath)),
-    );
-  return [...new Set(relativePaths)];
+const checkoutRootCache = new Map();
+
+// The checkout a file belongs to: the nearest directory holding a `.git`
+// entry, which is a directory in a main checkout and a file in a linked
+// worktree or a submodule. A worktree nested inside another checkout (the
+// usual `.claude/worktrees/<name>`) is its own root, so its files are
+// formatted and linted with its own tools and its own root config. Taken from
+// the session's working directory instead, oxlint run from the outer checkout
+// reads the worktree's root `.oxlintrc.json` as a nested config and refuses
+// the options only a root config may set.
+function getCheckoutRoot(filePath) {
+  const visited = [];
+  let directory = path.dirname(filePath);
+  let root;
+  for (;;) {
+    const cached = checkoutRootCache.get(directory);
+    if (cached !== undefined) {
+      root = cached;
+      break;
+    }
+    visited.push(directory);
+    if (fs.existsSync(path.join(directory, ".git"))) {
+      root = directory;
+      break;
+    }
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      root = null;
+      break;
+    }
+    directory = parent;
+  }
+  for (const entry of visited) {
+    checkoutRootCache.set(entry, root);
+  }
+  return root ?? undefined;
+}
+
+// Group session-edit absolute paths by the checkout each belongs to, as paths
+// relative to it, dropping anything outside an Instrument checkout or since
+// deleted.
+function groupByCheckout(paths) {
+  const groups = new Map();
+  for (const filePath of paths) {
+    const repoRoot = getCheckoutRoot(filePath);
+    if (!repoRoot || !isInstrumentRepoRoot(repoRoot)) {
+      continue;
+    }
+    const relativePath = getSafeRelativePath({ filePath, repoRoot });
+    if (!relativePath || !fileExists(filePath)) {
+      continue;
+    }
+    const group = groups.get(repoRoot) ?? new Set();
+    group.add(relativePath);
+    groups.set(repoRoot, group);
+  }
+  return [...groups].map(([repoRoot, relativePaths]) => ({
+    relativePaths: [...relativePaths],
+    repoRoot,
+  }));
 }
 
 const instrumentRepoRootCache = new Map();
@@ -446,7 +496,11 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
 
 // PostToolUse stays deliberately cheap: a single oxfmt on the one file that
 // changed. Lint autofixes are batched at Stop instead of paid per edit.
-async function formatEditedFile({ filePath, repoRoot }) {
+async function formatEditedFile({ filePath }) {
+  const repoRoot = getCheckoutRoot(filePath);
+  if (!repoRoot) {
+    return;
+  }
   const relativePath = getSafeRelativePath({ filePath, repoRoot });
   if (
     !relativePath ||
@@ -510,8 +564,7 @@ function readStdin() {
 }
 
 async function handleStop({ data, repoRoot }) {
-  const roots = getStopRoots({ data, repoRoot });
-  if (roots.length === 0) {
+  if (getStopRoots({ data, repoRoot }).length === 0) {
     return "{}";
   }
 
@@ -529,15 +582,13 @@ async function handleStop({ data, repoRoot }) {
   const shouldReport =
     data.hook_event_name === "Stop" && data.stop_hook_active !== true;
 
+  // Each file is checked from its own checkout, so a session that edited a
+  // worktree and then left it still has that work checked by the worktree's
+  // tools, not by whichever checkout the session ended in.
   let lintReport = "";
-  for (const root of roots) {
-    const relativePaths = toExistingRelativePaths({
-      paths: editedPaths,
-      repoRoot: root,
-    });
-    if (relativePaths.length === 0) {
-      continue;
-    }
+  for (const { relativePaths, repoRoot: root } of groupByCheckout(
+    editedPaths,
+  )) {
     lintReport += await formatFiles(root, relativePaths, {
       report: shouldReport,
     });
@@ -552,14 +603,14 @@ async function handleStop({ data, repoRoot }) {
   });
 }
 
-async function handleEdit({ cwd, data, eventName, repoRoot }) {
+async function handleEdit({ cwd, data, eventName }) {
   if (
     eventName === "afterFileEdit" &&
     typeof data.file_path === "string" &&
     data.file_path.length > 0
   ) {
     const filePath = path.resolve(data.file_path);
-    await formatEditedFile({ filePath, repoRoot });
+    await formatEditedFile({ filePath });
     recordSessionEdit(data.session_id, filePath);
     return;
   }
@@ -573,7 +624,7 @@ async function handleEdit({ cwd, data, eventName, repoRoot }) {
       path.resolve(cwd, filePath),
     );
     await Promise.all(
-      filePaths.map((filePath) => formatEditedFile({ filePath, repoRoot })),
+      filePaths.map((filePath) => formatEditedFile({ filePath })),
     );
     for (const filePath of filePaths) {
       recordSessionEdit(data.session_id, filePath);
@@ -587,7 +638,7 @@ async function handleEdit({ cwd, data, eventName, repoRoot }) {
     data.tool_input.file_path.length > 0
   ) {
     const filePath = path.resolve(data.tool_input.file_path);
-    await formatEditedFile({ filePath, repoRoot });
+    await formatEditedFile({ filePath });
     recordSessionEdit(data.session_id, filePath);
   }
 }
@@ -612,7 +663,7 @@ try {
   if (eventName === "Stop") {
     result = await handleStop({ data, repoRoot });
   } else {
-    await handleEdit({ cwd, data, eventName, repoRoot });
+    await handleEdit({ cwd, data, eventName });
   }
 } catch (error) {
   console.error("[format-hook]", error?.message ?? error);

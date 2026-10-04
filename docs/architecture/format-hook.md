@@ -58,7 +58,11 @@ Batches are capped at 40 files to keep argv under `ARG_MAX`.
 
 ## Multi-root workspaces
 
-`getStopRoots` resolves the roots to act on. When a workspace has several, only the alphabetically-first root's session does the work, so parallel sessions do not each repeat it. A root only qualifies if its `package.json` name is one of the known Instrument roots and it has a `.git` entry.
+`getStopRoots` decides whether this session's Stop runs at all. When a workspace has several roots, only the alphabetically-first root's session does the work, so parallel sessions do not each repeat it. A root only qualifies if its `package.json` name is one of the known Instrument roots and it has a `.git` entry.
+
+## Checkout roots
+
+Each edited file is formatted and linted from its own checkout, the nearest directory with a `.git` entry (`getCheckoutRoot`), not from the session's working directory. A linked worktree nested in a checkout (`.claude/worktrees/<name>`) is a checkout of its own, and its root `.oxlintrc.json` sets options only a root config may (`options.typeAware`). Run from the outer checkout, oxlint reads that file as a nested config and refuses it, so a session that edited a worktree and then left it before Stop got a config error back as lint to fix. The same resolution keeps the PostToolUse oxfmt pass on the edited file's own tools.
 
 ## Verifying changes
 

@@ -292,6 +292,51 @@ async function main() {
       `got: ${rotated.trim()}`,
     );
 
+    // A worktree nested in the checkout (`.claude/worktrees/<name>`) is a
+    // checkout of its own, with a root config that may set options only a root
+    // config may. A session that edited it and then left it ends its turn in
+    // the outer checkout, which must not lint the worktree's files as its own.
+    console.log("\nNested worktree");
+    const worktreeSession = session("worktree");
+    const worktreeRoot = path.join(fixtureRoot, "worktree");
+    fs.mkdirSync(worktreeRoot);
+    fs.writeFileSync(
+      path.join(worktreeRoot, ".git"),
+      `gitdir: ${path.join(worktreeRoot, ".gitdir")}\n`,
+    );
+    fs.copyFileSync(
+      path.join(repoRoot, "package.json"),
+      path.join(worktreeRoot, "package.json"),
+    );
+    fs.writeFileSync(
+      path.join(worktreeRoot, ".oxlintrc.json"),
+      `${JSON.stringify({
+        categories: { correctness: "error" },
+        options: { typeAware: true },
+      })}\n`,
+    );
+    fs.symlinkSync(
+      path.join(repoRoot, "node_modules"),
+      path.join(worktreeRoot, "node_modules"),
+    );
+    const worktreeFile = path.join(worktreeRoot, "code.ts");
+    fs.writeFileSync(worktreeFile, UNFORMATTED_TS);
+    seedLedger(worktreeSession, [worktreeFile]);
+    const fromOutside = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: worktreeSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "a worktree's edits are linted from the worktree, not the outer checkout",
+      fromOutside.trim() === "{}" && read(worktreeFile).includes("v = [1, 2]"),
+      `got: ${fromOutside.trim().slice(0, 300)} / ${read(worktreeFile).trim()}`,
+    );
+
     console.log("\nReport");
     const blockSession = session("block");
     // A duplicate key is in oxlint's correctness category and has no fixer, so
