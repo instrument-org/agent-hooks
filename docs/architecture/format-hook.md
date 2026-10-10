@@ -10,12 +10,12 @@ That instruction is only true because the hook runs. If the hook stops working, 
 
 ## Events
 
-| Event                           | Source      | Work                                                    |
-| ------------------------------- | ----------- | ------------------------------------------------------- |
-| `PostToolUse` (`Edit`, `Write`) | Claude Code | oxfmt the one file, record it                           |
-| `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                    |
-| `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                           |
-| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains |
+| Event                           | Source      | Work                                                                               |
+| ------------------------------- | ----------- | ---------------------------------------------------------------------------------- |
+| `PostToolUse` (`Edit`, `Write`) | Claude Code | oxfmt the one file, record it                                                      |
+| `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                                               |
+| `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                                                      |
+| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains and what knip finds unused |
 
 Cursor sends camelCase event names and Claude Code sends PascalCase; `normalizeEventName` folds them together. The blocking report is gated on the raw `hook_event_name === "Stop"` rather than the normalized value, because only Claude Code honours the block contract.
 
@@ -37,12 +37,15 @@ At `Stop`, for the files this turn edited:
 2. `oxfmt` over everything formattable
 3. `oxlint --fix` over the lintable subset, plus `--type-aware --quiet` when reporting
 4. `oxfmt` again, but only over files a fixer actually rewrote
+5. `knip`, when reporting and the turn edited code or a `package.json`
 
 The order matters. typos runs first so everything after it formats corrected text. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
 
 The spelling pass goes through the consuming repo's own `scripts/typos.ts`, which vendors the pinned checksum-verified binary, so a repo without that script skips the pass. It passes `--force-exclude`, without which typos would ignore `typos.toml`'s `extend-exclude` for the paths handed to it: the files excluded there are excluded because their misspellings are the content, and correcting one erases what it documents.
 
 oxlint fixes and reports in one spawn from the repo root, where it resolves each file's nearest `.oxlintrc.json`, so a turn that touched three packages still costs one process. What `--fix` leaves behind is exactly what `check:lint` would report. The report includes type-aware rules, which cost about 1.5s for a turn's worth of files, and leaves out warnings, which are advice rather than something to block a turn on. `--no-error-on-unmatched-pattern` keeps a batch made only of ignored files quiet instead of reporting "no files found" as a problem.
+
+knip runs last because a lint fix can be what leaves something unused: dropping an unused import can orphan the export it named. It analyzes the whole project, about 1.4s in the monorepo, and the hook keeps two kinds of finding: anything in a file the turn edited, and dependency findings in the `package.json` of any workspace the turn edited a file in. The second is wider than the ledger because a dependency goes unused when its last import is deleted somewhere else, and is added by `pnpm add`, neither of which reaches the manifest through a recorded edit. An export left unused in a file the turn never edited is not reported, since a parallel agent's half-finished work produces exactly that; CI's `check:unused` still catches it. knip exits non-zero whenever it finds anything, so only output that parses as its JSON report counts, and a config error or crash is dropped rather than handed to the agent. A repo without `node_modules/.bin/knip` skips the pass.
 
 ## Which files get formatted when
 

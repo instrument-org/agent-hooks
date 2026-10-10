@@ -436,6 +436,82 @@ async function runTypos(repoRoot, files) {
   return "";
 }
 
+// The package.json a file belongs to: the nearest one at or below repoRoot.
+function owningManifest(repoRoot, relativePath) {
+  let directory = path.dirname(relativePath);
+  for (;;) {
+    const manifest = path.join(directory, "package.json");
+    if (fileExists(path.join(repoRoot, manifest))) {
+      return path.normalize(manifest);
+    }
+    if (directory === "." || directory === "") {
+      return;
+    }
+    directory = path.dirname(directory);
+  }
+}
+
+// What knip says is unused, kept to what this turn could have caused: findings
+// in a file it edited, and dependency findings in the package.json of any
+// workspace it edited a file in. The second is wider than the edits on purpose,
+// since a dependency goes unused when its last import is deleted somewhere else
+// and is added by `pnpm add`, neither of which touches the manifest through an
+// edit the ledger sees. An export left unused in a file the turn never opened
+// is not reported here; CI's `check:unused` still is.
+async function runKnip(repoRoot, relativePaths) {
+  const knipPath = path.join(repoRoot, "node_modules/.bin/knip");
+  // Prose and styles cannot leave code unused, so a turn that only touched
+  // those skips the pass, and they bring no workspace's manifest into scope.
+  const code = relativePaths.filter(
+    (file) => LINT_EXT.test(file) || path.basename(file) === "package.json",
+  );
+  if (!fileExists(knipPath) || code.length === 0) {
+    return "";
+  }
+  const edited = new Set(relativePaths.map((file) => path.normalize(file)));
+  const manifests = new Set(
+    code.map((file) => owningManifest(repoRoot, file)).filter(Boolean),
+  );
+
+  // knip exits 1 when it finds anything, so the exit code says nothing here
+  // and only JSON that parses counts as an answer. A config error or a crash
+  // prints something else and is not the agent's to fix.
+  const { stdout } = await execTool(
+    knipPath,
+    ["--reporter", "json", "--no-progress", "--no-config-hints"],
+    { cwd: repoRoot },
+  );
+  let rows = [];
+  try {
+    rows = JSON.parse(stdout).issues ?? [];
+  } catch {
+    return "";
+  }
+
+  const lines = [];
+  for (const row of rows) {
+    const file = path.normalize(row.file);
+    const isManifest = path.basename(file) === "package.json";
+    if (!edited.has(file) && !(isManifest && manifests.has(file))) {
+      continue;
+    }
+    for (const [kind, issues] of Object.entries(row)) {
+      if (!Array.isArray(issues) || kind === "owners") {
+        continue;
+      }
+      for (const issue of issues.flat()) {
+        const where = issue.line ? `:${issue.line}:${issue.col ?? 1}` : "";
+        lines.push(
+          kind === "files"
+            ? `${row.file}  unused file`
+            : `${row.file}${where}  ${kind}  ${issue.name}`,
+        );
+      }
+    }
+  }
+  return lines.length > 0 ? `${lines.join("\n")}\n` : "";
+}
+
 // -------------------------------------------------------------------------
 // Pipelines
 // -------------------------------------------------------------------------
@@ -455,10 +531,11 @@ function snapshotMtimes(repoRoot, relativePaths) {
   return mtimes;
 }
 
-// Returns whatever oxlint could not fix, when `report` is set.
+// Returns whatever oxlint could not fix and what knip finds unused, when
+// `report` is set.
 async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   if (relativePaths.length === 0 || !isInstrumentRepoRoot(repoRoot)) {
-    return "";
+    return { lint: "", unused: "" };
   }
 
   // Spelling first, so every pass below sees corrected text. Unfiltered by
@@ -491,7 +568,11 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   );
   await runBatched(repoRoot, rewritten, runOxfmt);
 
-  return lintReport;
+  // Last, over the code as the fixes left it: a fix that drops an unused
+  // import can be what leaves an export unused.
+  const unused = report ? await runKnip(repoRoot, relativePaths) : "";
+
+  return { lint: lintReport, unused };
 }
 
 // PostToolUse stays deliberately cheap: a single oxfmt on the one file that
@@ -514,13 +595,27 @@ async function formatEditedFile({ filePath }) {
   }
 }
 
-function buildLintReason(report) {
+function truncate(report) {
   const maxLength = 6000;
-  let body = report.trim();
-  if (body.length > maxLength) {
-    body = `${body.slice(0, maxLength)}\n… (truncated)`;
+  const body = report.trim();
+  return body.length > maxLength
+    ? `${body.slice(0, maxLength)}\n… (truncated)`
+    : body;
+}
+
+function buildReason({ lint, unused }) {
+  const sections = [];
+  if (lint.trim()) {
+    sections.push(
+      `oxlint reported problems that --fix could not resolve. Fix them before finishing:\n\n${truncate(lint)}`,
+    );
   }
-  return `oxlint reported problems that --fix could not resolve. Fix them before finishing:\n\n${body}`;
+  if (unused.trim()) {
+    sections.push(
+      `knip found code and dependencies nothing uses in what you changed, which fails CI's check:unused. Delete or unexport each one, or remove the dependency, before finishing:\n\n${truncate(unused)}`,
+    );
+  }
+  return sections.join("\n\n");
 }
 
 // -------------------------------------------------------------------------
@@ -585,22 +680,22 @@ async function handleStop({ data, repoRoot }) {
   // Each file is checked from its own checkout, so a session that edited a
   // worktree and then left it still has that work checked by the worktree's
   // tools, not by whichever checkout the session ended in.
-  let lintReport = "";
+  const found = { lint: "", unused: "" };
   for (const { relativePaths, repoRoot: root } of groupByCheckout(
     editedPaths,
   )) {
-    lintReport += await formatFiles(root, relativePaths, {
+    const { lint, unused } = await formatFiles(root, relativePaths, {
       report: shouldReport,
     });
+    found.lint += lint;
+    found.unused += unused;
   }
 
-  if (!lintReport.trim()) {
+  const reason = buildReason(found);
+  if (!reason) {
     return "{}";
   }
-  return JSON.stringify({
-    decision: "block",
-    reason: buildLintReason(lintReport),
-  });
+  return JSON.stringify({ decision: "block", reason });
 }
 
 async function handleEdit({ cwd, data, eventName }) {

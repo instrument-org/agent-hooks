@@ -331,9 +331,12 @@ async function main() {
         stop_hook_active: false,
       },
     });
+    // knip may still answer: the fixture checkout has no knip config, so to it
+    // every file and dependency is unused. Only oxlint's answer is in question.
     check(
       "a worktree's edits are linted from the worktree, not the outer checkout",
-      fromOutside.trim() === "{}" && read(worktreeFile).includes("v = [1, 2]"),
+      !fromOutside.includes("oxlint reported") &&
+        read(worktreeFile).includes("v = [1, 2]"),
       `got: ${fromOutside.trim().slice(0, 300)} / ${read(worktreeFile).trim()}`,
     );
 
@@ -380,6 +383,50 @@ async function main() {
       "stop_hook_active suppresses the block (no loop)",
       noLoop.trim() === "{}",
       `got: ${noLoop.trim().slice(0, 200)}`,
+    );
+
+    // The fixture directory is outside every knip entry, so any .ts file in it
+    // is an unused file to knip: a finding in the ledger, and one beside it.
+    console.log("\nUnused");
+    const unusedSession = session("unused");
+    const myOrphan = fixture("my-orphan.ts", "export const mine = 1;\n");
+    fixture("their-orphan.ts", "export const theirs = 1;\n");
+    seedLedger(unusedSession, [myOrphan]);
+    const unused = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: unusedSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "knip findings in an edited file block Stop",
+      unused.includes("knip") && unused.includes("my-orphan.ts"),
+      `got: ${unused.trim().slice(0, 300)}`,
+    );
+    check(
+      "knip findings in a file the turn did not edit are not reported",
+      !unused.includes("their-orphan.ts"),
+      `got: ${unused.trim().slice(0, 300)}`,
+    );
+
+    const proseSession = session("unused-prose");
+    seedLedger(proseSession, [fixture("notes.md", "# Notes\n")]);
+    const proseOnly = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: proseSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "a prose-only turn skips knip",
+      proseOnly.trim() === "{}",
+      `got: ${proseOnly.trim().slice(0, 300)}`,
     );
 
     console.log("\nEdge cases");
