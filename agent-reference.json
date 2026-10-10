@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-reference.dev/schema/agent-reference.schema.json",
+  "references": {
+    "instrument": {
+      "source": "github:instrument-org/instrument",
+      "description": "Consumer. The Instrument monorepo, root package @instrument-org/monorepo. Wires format.mjs into .claude/settings.json and .codex/hooks.json and installs this package as a root devDependency; a change here lands there through `pnpm update @instrument-org/agent-hooks` and a lockfile commit."
+    },
+    "internal": {
+      "source": "github:instrument-org/internal",
+      "description": "Consumer. The platform API (apps/api) and the marketing and account site (apps/web), root package @instrument/internal. Same wiring and update path as instrument."
+    },
+    "skills": {
+      "source": "github:instrument-org/skills",
+      "description": "Consumer. The skills registry, root package @instrument-org/skills. Same wiring and update path as instrument."
+    }
+  }
+}
