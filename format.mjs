@@ -512,6 +512,142 @@ async function runKnip(repoRoot, relativePaths) {
   return lines.length > 0 ? `${lines.join("\n")}\n` : "";
 }
 
+// The tests that import what this turn edited, run in the package each edit
+// belongs to, so a break surfaces before the work lands instead of in CI. A
+// package takes part when it has its own vitest and vitest config: a root
+// that only hoists the binary would crawl every test in the tree without the
+// aliases each package's config sets up; the projects its `test:ci`
+// names are the ones run, so a browser project kept out of CI stays out here.
+// The whole pass shares one deadline, and a package that runs past it says
+// nothing: a hook that stalls a turn on a slow suite costs more than CI
+// catching the break. Workers are capped the way CI caps them, since other
+// agents are usually working in the same checkout.
+const RELATED_TESTS_DEADLINE_MS = 60_000;
+const VITEST_CONFIGS = ["ts", "mts", "js", "mjs"].map(
+  (extension) => `vitest.config.${extension}`,
+);
+const MAX_FAILURES_REPORTED = 10;
+
+function packageTestProjects(packageDirectory) {
+  try {
+    const { scripts } = JSON.parse(
+      fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8"),
+    );
+    const testCi =
+      typeof scripts?.["test:ci"] === "string" ? scripts["test:ci"] : "";
+    return [...testCi.matchAll(/--project[= ](\S+)/g)].flatMap((match) => [
+      "--project",
+      match[1],
+    ]);
+  } catch {
+    return [];
+  }
+}
+
+function describeFailures(report, packageDirectory) {
+  const lines = [];
+  for (const file of report.testResults ?? []) {
+    const relativeFile = path.relative(packageDirectory, file.name);
+    const failed = (file.assertionResults ?? []).filter(
+      (assertion) => assertion.status === "failed",
+    );
+    // A file that fails before any test runs (an import error, a throw at the
+    // top level) has no failed assertion, only its own message.
+    if (failed.length === 0 && file.status === "failed") {
+      lines.push(`${relativeFile}\n  ${firstLines(file.message)}`);
+    }
+    for (const assertion of failed) {
+      lines.push(
+        `${relativeFile} > ${assertion.fullName}\n  ${firstLines(assertion.failureMessages?.[0])}`,
+      );
+    }
+  }
+  const shown = lines.slice(0, MAX_FAILURES_REPORTED);
+  if (lines.length > shown.length) {
+    shown.push(`… and ${lines.length - shown.length} more`);
+  }
+  return shown;
+}
+
+function firstLines(message = "", count = 6) {
+  return message.trim().split("\n").slice(0, count).join("\n  ");
+}
+
+async function runRelatedTests(repoRoot, relativePaths) {
+  const byPackage = new Map();
+  for (const file of relativePaths.filter((file) => LINT_EXT.test(file))) {
+    const manifest = owningManifest(repoRoot, file);
+    if (!manifest) {
+      continue;
+    }
+    const packageDirectory = path.join(repoRoot, path.dirname(manifest));
+    if (
+      !fileExists(path.join(packageDirectory, "node_modules/.bin/vitest")) ||
+      !VITEST_CONFIGS.some((name) =>
+        fileExists(path.join(packageDirectory, name)),
+      )
+    ) {
+      continue;
+    }
+    const files = byPackage.get(packageDirectory) ?? [];
+    files.push(path.join(repoRoot, file));
+    byPackage.set(packageDirectory, files);
+  }
+
+  const deadline = Date.now() + RELATED_TESTS_DEADLINE_MS;
+  const sections = [];
+  // One package at a time: each run already spreads across workers, and two
+  // suites at once on a shared checkout is what the worker cap is there to avoid.
+  for (const [packageDirectory, files] of byPackage) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      break;
+    }
+    const outputFile = path.join(
+      os.tmpdir(),
+      "instrument-agent-hooks",
+      `vitest-${process.pid}-${sections.length}-${Date.now()}.json`,
+    );
+    fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+    await execTool(
+      path.join(packageDirectory, "node_modules/.bin/vitest"),
+      [
+        "related",
+        ...files,
+        "--run",
+        "--passWithNoTests",
+        "--maxWorkers=40%",
+        ...packageTestProjects(packageDirectory),
+        "--reporter=json",
+        `--outputFile=${outputFile}`,
+      ],
+      {
+        cwd: packageDirectory,
+        env: { ...process.env, CI: "true" },
+        timeout: remaining,
+      },
+    );
+    // vitest exits non-zero on a failed test, so only a report that parses
+    // counts. A run killed at the deadline, or one that crashed on its own
+    // config, leaves none and is not the agent's to fix.
+    let report;
+    try {
+      report = JSON.parse(fs.readFileSync(outputFile, "utf8"));
+    } catch {
+      continue;
+    } finally {
+      fs.rmSync(outputFile, { force: true });
+    }
+    const failures = describeFailures(report, packageDirectory);
+    if (failures.length > 0) {
+      sections.push(
+        `${path.relative(repoRoot, packageDirectory) || "."}:\n${failures.join("\n")}`,
+      );
+    }
+  }
+  return sections.length > 0 ? `${sections.join("\n\n")}\n` : "";
+}
+
 // -------------------------------------------------------------------------
 // Pipelines
 // -------------------------------------------------------------------------
@@ -531,11 +667,11 @@ function snapshotMtimes(repoRoot, relativePaths) {
   return mtimes;
 }
 
-// Returns whatever oxlint could not fix and what knip finds unused, when
-// `report` is set.
+// Returns whatever oxlint could not fix, what knip finds unused, and which
+// related tests fail, when `report` is set.
 async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   if (relativePaths.length === 0 || !isInstrumentRepoRoot(repoRoot)) {
-    return { lint: "", unused: "" };
+    return { lint: "", tests: "", unused: "" };
   }
 
   // Spelling first, so every pass below sees corrected text. Unfiltered by
@@ -569,10 +705,17 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   await runBatched(repoRoot, rewritten, runOxfmt);
 
   // Last, over the code as the fixes left it: a fix that drops an unused
-  // import can be what leaves an export unused.
-  const unused = report ? await runKnip(repoRoot, relativePaths) : "";
+  // import can be what leaves an export unused, and the tests should see the
+  // code that will be committed. The two read and never write, so they run
+  // side by side.
+  const [unused, tests] = report
+    ? await Promise.all([
+        runKnip(repoRoot, relativePaths),
+        runRelatedTests(repoRoot, relativePaths),
+      ])
+    : ["", ""];
 
-  return { lint: lintReport, unused };
+  return { lint: lintReport, tests, unused };
 }
 
 // PostToolUse stays deliberately cheap: a single oxfmt on the one file that
@@ -603,7 +746,7 @@ function truncate(report) {
     : body;
 }
 
-function buildReason({ lint, unused }) {
+function buildReason({ lint, tests, unused }) {
   const sections = [];
   if (lint.trim()) {
     sections.push(
@@ -613,6 +756,11 @@ function buildReason({ lint, unused }) {
   if (unused.trim()) {
     sections.push(
       `knip found code and dependencies nothing uses in what you changed, which fails CI's check:unused. Delete or unexport each one, or remove the dependency, before finishing:\n\n${truncate(unused)}`,
+    );
+  }
+  if (tests.trim()) {
+    sections.push(
+      `Tests that import what you changed fail, which fails CI's test:ci. Fix the code or the test before finishing. A failure in code you did not touch can be another agent's work in progress; if so, say that and leave it:\n\n${truncate(tests)}`,
     );
   }
   return sections.join("\n\n");
@@ -680,14 +828,15 @@ async function handleStop({ data, repoRoot }) {
   // Each file is checked from its own checkout, so a session that edited a
   // worktree and then left it still has that work checked by the worktree's
   // tools, not by whichever checkout the session ended in.
-  const found = { lint: "", unused: "" };
+  const found = { lint: "", tests: "", unused: "" };
   for (const { relativePaths, repoRoot: root } of groupByCheckout(
     editedPaths,
   )) {
-    const { lint, unused } = await formatFiles(root, relativePaths, {
+    const { lint, tests, unused } = await formatFiles(root, relativePaths, {
       report: shouldReport,
     });
     found.lint += lint;
+    found.tests += tests;
     found.unused += unused;
   }
 

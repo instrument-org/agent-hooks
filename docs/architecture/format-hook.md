@@ -15,7 +15,7 @@ That instruction is only true because the hook runs. If the hook stops working, 
 | `PostToolUse` (`Edit`, `Write`) | Claude Code | oxfmt the one file, record it                                                      |
 | `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                                               |
 | `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                                                      |
-| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains and what knip finds unused |
+| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains, what knip finds unused, and related tests that fail |
 
 Cursor sends camelCase event names and Claude Code sends PascalCase; `normalizeEventName` folds them together. The blocking report is gated on the raw `hook_event_name === "Stop"` rather than the normalized value, because only Claude Code honours the block contract.
 
@@ -38,6 +38,7 @@ At `Stop`, for the files this turn edited:
 3. `oxlint --fix` over the lintable subset, plus `--type-aware --quiet` when reporting
 4. `oxfmt` again, but only over files a fixer actually rewrote
 5. `knip`, when reporting and the turn edited code or a `package.json`
+6. `vitest related`, when reporting, alongside knip
 
 The order matters. typos runs first so everything after it formats corrected text. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
 
@@ -46,6 +47,8 @@ The spelling pass goes through the consuming repo's own `scripts/typos.ts`, whic
 oxlint fixes and reports in one spawn from the repo root, where it resolves each file's nearest `.oxlintrc.json`, so a turn that touched three packages still costs one process. What `--fix` leaves behind is exactly what `check:lint` would report. The report includes type-aware rules, which cost about 1.5s for a turn's worth of files, and leaves out warnings, which are advice rather than something to block a turn on. `--no-error-on-unmatched-pattern` keeps a batch made only of ignored files quiet instead of reporting "no files found" as a problem.
 
 knip runs last because a lint fix can be what leaves something unused: dropping an unused import can orphan the export it named. It analyzes the whole project, about 1.4s in the monorepo, and the hook keeps two kinds of finding: anything in a file the turn edited, and dependency findings in the `package.json` of any workspace the turn edited a file in. The second is wider than the ledger because a dependency goes unused when its last import is deleted somewhere else, and is added by `pnpm add`, neither of which reaches the manifest through a recorded edit. An export left unused in a file the turn never edited is not reported, since a parallel agent's half-finished work produces exactly that; CI's `check:unused` still catches it. knip exits non-zero whenever it finds anything, so only output that parses as its JSON report counts, and a config error or crash is dropped rather than handed to the agent. A repo without `node_modules/.bin/knip` skips the pass.
+
+The tests that import the turn's code edits run last, beside knip, since both only read. Each edit runs in the package that owns it, and only when that package has its own `node_modules/.bin/vitest` and a `vitest.config.*`: a root that only hoists the binary would crawl every test in the tree without the aliases each package's config sets up. The projects named by `--project` in the package's `test:ci` are the ones run, so a browser project CI leaves out stays out. Packages run one at a time with `--maxWorkers=40%` and `CI=true`, matching CI, because other agents usually share the checkout. The whole pass shares a 60s deadline; a package still running at the deadline is killed and reports nothing, as does a run that leaves no JSON report. A typical studio edit pulls in 40 to 70 test files and adds about 10s to the turn. The report asks the agent to say so and move on when a failure comes from code it never touched, since that can be another agent's work in progress. A test in one package that imports a file from another is not found: the run is scoped to the edit's own package, and CI still catches it.
 
 ## Which files get formatted when
 

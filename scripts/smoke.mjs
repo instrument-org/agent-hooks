@@ -429,6 +429,90 @@ async function main() {
       `got: ${proseOnly.trim().slice(0, 300)}`,
     );
 
+    // A package of its own, so the edit has a manifest with a vitest config
+    // beside it. Its vitest forwards to the repo's, since installing one into
+    // the fixture would take longer than the rest of the suite.
+    console.log("\nRelated tests");
+    const testPackage = path.join(fixtureRoot, "tested");
+    fs.mkdirSync(path.join(testPackage, "node_modules/.bin"), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(testPackage, "package.json"),
+      '{ "name": "smoke-tested", "type": "module" }\n',
+    );
+    fs.writeFileSync(
+      path.join(testPackage, "vitest.config.mjs"),
+      "export default {};\n",
+    );
+    const vitestShim = path.join(testPackage, "node_modules/.bin/vitest");
+    fs.writeFileSync(
+      vitestShim,
+      `#!/bin/sh\nexec "${path.join(repoRoot, "node_modules/.bin/vitest")}" "$@"\n`,
+    );
+    fs.chmodSync(vitestShim, 0o755);
+    const tested = (name, contents) => {
+      const file = path.join(testPackage, name);
+      fs.writeFileSync(file, contents);
+      return file;
+    };
+    const vitestImport = `import { expect, it } from "${path.join(repoRoot, "node_modules/vitest/dist/index.js")}";\n`;
+    const brokenSource = tested("broken.mjs", "export const answer = 41;\n");
+    tested(
+      "broken.test.mjs",
+      `${vitestImport}import { answer } from "./broken.mjs";\nit("adds up", () => { expect(answer).toBe(42); });\n`,
+    );
+    const sound = tested("sound.mjs", "export const answer = 42;\n");
+    tested(
+      "sound.test.mjs",
+      `${vitestImport}import { answer } from "./sound.mjs";\nit("holds", () => { expect(answer).toBe(42); });\n`,
+    );
+
+    // Fails whenever it runs, so it reports only if an unrelated test ran.
+    tested(
+      "unrelated.test.mjs",
+      `${vitestImport}it("is never run", () => { expect(1).toBe(2); });\n`,
+    );
+
+    const failingSession = session("tests-failing");
+    seedLedger(failingSession, [brokenSource]);
+    const failing = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: failingSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "a failing test that imports an edit blocks Stop",
+      failing.includes("Tests that import") && failing.includes("adds up"),
+      `got: ${failing.trim().slice(0, 300)}`,
+    );
+    check(
+      "tests that do not import the edit are not run",
+      !failing.includes("is never run"),
+      `got: ${failing.trim().slice(0, 300)}`,
+    );
+
+    const passingSession = session("tests-passing");
+    seedLedger(passingSession, [sound]);
+    const passing = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: passingSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "passing related tests leave nothing to report",
+      !passing.includes("Tests that import"),
+      `got: ${passing.trim().slice(0, 300)}`,
+    );
+
     console.log("\nEdge cases");
     const noLedger = await runHook({
       cwd: repoRoot,
