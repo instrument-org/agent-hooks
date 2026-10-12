@@ -35,7 +35,7 @@ Files older than a week are pruned on each `Stop`.
 
 An agent writes files from Bash as well as through Edit and Write: a heredoc, `sed -i`, a script. Nothing in a Bash event names those files, and before this they reached neither the immediate format nor the Stop sweep. So `PreToolUse` on Bash notes every changed or untracked file in the session's checkout with its mtime (`git status`, about 25ms), and `PostToolUse` records each one whose mtime moved, or that became dirty, during the command, formatting it like an Edit. The two together add about 140ms to a Bash call, almost all of it Node starting twice.
 
-The window is the command's own run, so a parallel agent writing in the same checkout during those seconds is attributed to this session, which the ledger otherwise avoids. A session working in a worktree of its own has no such neighbor. A command that writes in a checkout other than the session's is not seen.
+A file counts only when the command's text contains its name. Without that, a parallel agent that saved a file in the same checkout during a long command was taken for this session's work and handed back to it to fix, which happened within the first hour. A heredoc, `sed -i` and a script written inline all name what they write; a generator or a script file that writes paths it never names is missed, as is a command that writes in a checkout other than the session's.
 
 ## Pipeline order
 

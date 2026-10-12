@@ -547,6 +547,19 @@ async function main() {
       `ledger: ${shellLedger.trim()}`,
     );
 
+    await runHook({ cwd: repoRoot, hook, payload: shellPayload("PreToolUse") });
+    // Another agent saving a file while this command runs.
+    const neighbor = fixture("neighbor.ts", UNFORMATTED_TS);
+    await runHook({ cwd: repoRoot, hook, payload: shellPayload("PostToolUse") });
+    const neighborLedger = fs.existsSync(ledgerFile(shellSession))
+      ? read(ledgerFile(shellSession))
+      : "";
+    check(
+      "a file the command does not name stays out, though it changed meanwhile",
+      !neighborLedger.includes(neighbor) && read(neighbor) === UNFORMATTED_TS,
+      `ledger: ${neighborLedger.trim()}`,
+    );
+
     console.log("\nEdge cases");
     const noLedger = await runHook({
       cwd: repoRoot,

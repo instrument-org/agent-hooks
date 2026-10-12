@@ -309,10 +309,10 @@ function takeSessionEdits(sessionId) {
 // An agent writes files from Bash too (a heredoc, sed -i, a script), and no
 // Edit or Write event says which. PreToolUse on Bash notes the checkout's
 // dirty files and their mtimes; PostToolUse records each one that changed
-// during the command as this session's edit, formatted like an Edit. A
-// parallel agent writing in the same checkout during those seconds is
-// attributed too, which the ledger otherwise avoids; in a worktree of its
-// own a session has no such neighbor.
+// during the command, and whose name the command contains, as this session's
+// edit, formatted like an Edit. A file a parallel agent saves in the same
+// checkout during those seconds is not named by this command, so it stays
+// out of the ledger; a script that writes files it never names is missed.
 // -------------------------------------------------------------------------
 
 function shellSnapshotFile(sessionId, toolUseId) {
@@ -392,8 +392,14 @@ async function recordShellEdits({ cwd, data }) {
   if (!after) {
     return;
   }
+  // Only a file the command names: a heredoc, sed -i and a script written
+  // inline all name what they write, and a parallel agent's file saved
+  // during a long command never appears in this one's text.
+  const command =
+    typeof data.tool_input?.command === "string" ? data.tool_input.command : "";
   const changed = Object.entries(after)
     .filter(([filePath, mtime]) => before[filePath] !== mtime)
+    .filter(([filePath]) => command.includes(path.basename(filePath)))
     .map(([filePath]) => filePath)
     .filter((filePath) => {
       const repoRoot = getCheckoutRoot(filePath);

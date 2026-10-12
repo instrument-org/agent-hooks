@@ -21,7 +21,7 @@ node "$(git rev-parse --show-toplevel)/node_modules/@instrument-org/agent-hooks/
 Both scripts run against a real consuming repo (one with `node_modules` installed) and confine their fixtures to a temp directory inside it, removed on exit. Neither touches anything else, which matters because a consuming repo usually has work in progress.
 
 ```sh
-# 25 behavioural assertions: what formats when, what is left alone,
+# 26 behavioural assertions: what formats when, what is left alone,
 # the parallel-agent scoping guarantee, nested worktrees, blocking,
 # related tests, shell edits, and degenerate input
 node scripts/smoke.mjs <path-to-consuming-repo>
