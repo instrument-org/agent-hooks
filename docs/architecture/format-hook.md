@@ -13,6 +13,8 @@ That instruction is only true because the hook runs. If the hook stops working, 
 | Event                           | Source      | Work                                                                               |
 | ------------------------------- | ----------- | ---------------------------------------------------------------------------------- |
 | `PostToolUse` (`Edit`, `Write`) | Claude Code | oxfmt the one file, record it                                                      |
+| `PreToolUse` (`Bash`)           | Claude Code | note the checkout's dirty files and their mtimes                                   |
+| `PostToolUse` (`Bash`)          | Claude Code | oxfmt and record each dirty file the command changed                               |
 | `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                                               |
 | `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                                                      |
 | `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains, what knip finds unused, and related tests that fail |
@@ -28,6 +30,12 @@ Every recorded edit is appended to `<tmp>/instrument-agent-hooks/<session>.txt`.
 **Repeated work.** `Stop` consumes the ledger by renaming it aside before reading, so each turn end processes only the edits made since the previous one instead of replaying the whole session. Edits arriving while a turn runs land in a fresh file and are picked up next time.
 
 Files older than a week are pruned on each `Stop`.
+
+## Shell edits
+
+An agent writes files from Bash as well as through Edit and Write: a heredoc, `sed -i`, a script. Nothing in a Bash event names those files, and before this they reached neither the immediate format nor the Stop sweep. So `PreToolUse` on Bash notes every changed or untracked file in the session's checkout with its mtime (`git status`, about 25ms), and `PostToolUse` records each one whose mtime moved, or that became dirty, during the command, formatting it like an Edit. The two together add about 140ms to a Bash call, almost all of it Node starting twice.
+
+The window is the command's own run, so a parallel agent writing in the same checkout during those seconds is attributed to this session, which the ledger otherwise avoids. A session working in a worktree of its own has no such neighbor. A command that writes in a checkout other than the session's is not seen.
 
 ## Pipeline order
 

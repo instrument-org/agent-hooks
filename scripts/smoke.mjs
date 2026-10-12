@@ -513,6 +513,40 @@ async function main() {
       `got: ${passing.trim().slice(0, 300)}`,
     );
 
+    console.log("\nShell edits");
+    const shellSession = session("shell");
+    const untouched = fixture("untouched.ts", UNFORMATTED_TS);
+    const shellPayload = (event) => ({
+      cwd: repoRoot,
+      hook_event_name: event,
+      session_id: shellSession,
+      tool_input: { command: "cat > shell.ts" },
+      tool_name: "Bash",
+      tool_use_id: "toolu_smoke",
+    });
+    await runHook({ cwd: repoRoot, hook, payload: shellPayload("PreToolUse") });
+    // What a heredoc or sed -i does: a write no Edit or Write event names.
+    const shellFile = fixture("shell.ts", UNFORMATTED_TS);
+    await runHook({ cwd: repoRoot, hook, payload: shellPayload("PostToolUse") });
+    check(
+      "a file a shell command wrote is formatted",
+      read(shellFile).includes("[...[1, 2]]"),
+      `got: ${read(shellFile).trim()}`,
+    );
+    const shellLedger = fs.existsSync(ledgerFile(shellSession))
+      ? read(ledgerFile(shellSession))
+      : "";
+    check(
+      "a file a shell command wrote joins the ledger",
+      shellLedger.includes(shellFile),
+      `ledger: ${shellLedger.trim()}`,
+    );
+    check(
+      "a dirty file the command left alone does not",
+      !shellLedger.includes(untouched) && read(untouched) === UNFORMATTED_TS,
+      `ledger: ${shellLedger.trim()}`,
+    );
+
     console.log("\nEdge cases");
     const noLedger = await runHook({
       cwd: repoRoot,

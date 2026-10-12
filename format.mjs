@@ -303,6 +303,111 @@ function takeSessionEdits(sessionId) {
   ];
 }
 
+// -------------------------------------------------------------------------
+// Shell edits
+//
+// An agent writes files from Bash too (a heredoc, sed -i, a script), and no
+// Edit or Write event says which. PreToolUse on Bash notes the checkout's
+// dirty files and their mtimes; PostToolUse records each one that changed
+// during the command as this session's edit, formatted like an Edit. A
+// parallel agent writing in the same checkout during those seconds is
+// attributed too, which the ledger otherwise avoids; in a worktree of its
+// own a session has no such neighbor.
+// -------------------------------------------------------------------------
+
+function shellSnapshotFile(sessionId, toolUseId) {
+  return path.join(
+    os.tmpdir(),
+    "instrument-agent-hooks",
+    `${sessionId}.bash-${toolUseId ?? "call"}.json`,
+  );
+}
+
+// Every changed or untracked file in a checkout, by absolute path, with its
+// mtime; undefined when the directory is not in a git checkout.
+async function dirtyFiles(cwd) {
+  // From inside the directory, since the lookup starts at a path's parent.
+  const repoRoot = getCheckoutRoot(path.join(cwd, "_"));
+  if (!repoRoot) {
+    return undefined;
+  }
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      { cwd: repoRoot, maxBuffer: MAX_BUFFER },
+    ));
+  } catch {
+    return undefined;
+  }
+  const files = {};
+  const entries = stdout.split("\0");
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.length < 4) {
+      continue;
+    }
+    // A rename names its source next, which is not a file to record.
+    if (entry[0] === "R" || entry[0] === "C") {
+      index += 1;
+    }
+    const absolutePath = path.join(repoRoot, entry.slice(3));
+    try {
+      files[absolutePath] = fs.statSync(absolutePath).mtimeMs;
+    } catch {
+      // Deleted: nothing to format.
+    }
+  }
+  return files;
+}
+
+async function snapshotBeforeShell({ cwd, data }) {
+  const files = await dirtyFiles(data.cwd ?? cwd);
+  if (!files || !data.session_id) {
+    return;
+  }
+  try {
+    const file = shellSnapshotFile(data.session_id, data.tool_use_id);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(files));
+  } catch {
+    // Best effort -- without a snapshot this command's writes go unrecorded.
+  }
+}
+
+async function recordShellEdits({ cwd, data }) {
+  if (!data.session_id) {
+    return;
+  }
+  const snapshot = shellSnapshotFile(data.session_id, data.tool_use_id);
+  let before;
+  try {
+    before = JSON.parse(fs.readFileSync(snapshot, "utf8"));
+    fs.unlinkSync(snapshot);
+  } catch {
+    return;
+  }
+  const after = await dirtyFiles(data.cwd ?? cwd);
+  if (!after) {
+    return;
+  }
+  const changed = Object.entries(after)
+    .filter(([filePath, mtime]) => before[filePath] !== mtime)
+    .map(([filePath]) => filePath)
+    .filter((filePath) => {
+      const repoRoot = getCheckoutRoot(filePath);
+      return (
+        repoRoot !== undefined &&
+        getSafeRelativePath({ filePath, repoRoot }) !== undefined
+      );
+    });
+  await Promise.all(changed.map((filePath) => formatEditedFile({ filePath })));
+  for (const filePath of changed) {
+    recordSessionEdit(data.session_id, filePath);
+  }
+}
+
 // Delete session-edit files older than a week so /tmp does not accumulate.
 function pruneSessionEdits() {
   try {
@@ -859,7 +964,17 @@ async function handleEdit({ cwd, data, eventName }) {
     return;
   }
 
+  if (eventName === "PreToolUse" && data.tool_name === "Bash") {
+    await snapshotBeforeShell({ cwd, data });
+    return;
+  }
+
   if (eventName !== "PostToolUse") {
+    return;
+  }
+
+  if (data.tool_name === "Bash") {
+    await recordShellEdits({ cwd, data });
     return;
   }
 
