@@ -7,8 +7,10 @@ Shared agent hook scripts for Instrument repos, consumed via GitHub dep. `agent-
 In `.claude/settings.json` and `.codex/hooks.json`, point hook commands at:
 
 ```
-node "$(git rev-parse --show-toplevel)/node_modules/@instrument-org/agent-hooks/format.mjs"
+d=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0; node "$(dirname "$d")/node_modules/@instrument-org/agent-hooks/format.mjs"
 ```
+
+The guard skips the hook when the session's folder is no longer a checkout, most often a worktree removed while a session was still in it; without it every hook after that fails on `/node_modules/...`. The common dir finds the primary checkout's `node_modules` from a worktree that has none of its own. Codex reads a hook's stdout as JSON, so there the skip is `|| { printf '{}'; exit 0; }`.
 
 ## Updating
 
