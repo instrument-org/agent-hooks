@@ -18,6 +18,7 @@ That instruction is only true because the hook runs. If the hook stops working, 
 | `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                                               |
 | `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                                                      |
 | `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains, what knip finds unused, and related tests that fail |
+| `SubagentStop`                  | Claude Code | the same as `Stop`, for the subagent's own edits                                    |
 
 Cursor sends camelCase event names and Claude Code sends PascalCase; `normalizeEventName` folds them together. The blocking report is gated on the raw `hook_event_name === "Stop"` rather than the normalized value, because only Claude Code honours the block contract.
 
@@ -28,6 +29,8 @@ Every recorded edit is appended to `<tmp>/instrument-agent-hooks/<session>.txt`.
 **Parallel agents.** More than one agent may work in the same checkout. Acting on the repo's dirty set would mean rewriting files another agent is midway through editing. Everything at `Stop` is therefore scoped to what _this_ session edited.
 
 **Repeated work.** `Stop` consumes the ledger by renaming it aside before reading, so each turn end processes only the edits made since the previous one instead of replaying the whole session. Edits arriving while a turn runs land in a fresh file and are picked up next time.
+
+**Subagents.** A subagent's hook payloads carry its parent's `session_id` and its own `agent_id`, so its edits go to `<session>.<agent>.txt` and are checked at its `SubagentStop`, which blocks the subagent the same way `Stop` blocks a turn. A shared ledger would have the parent's turn end, which an orchestrating session reaches each time a background task reports, check files a subagent is still writing, and the subagent would never hear about its own lint.
 
 Files older than a week are pruned on each `Stop`.
 

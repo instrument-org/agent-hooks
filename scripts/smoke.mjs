@@ -385,6 +385,59 @@ async function main() {
       `got: ${noLoop.trim().slice(0, 200)}`,
     );
 
+    // A subagent's payloads carry the parent's session_id and its own
+    // agent_id. Its edits are checked when it stops, and the parent's turn
+    // end, which often comes while the subagent is still writing, skips them.
+    console.log("\nSubagents");
+    const parentSession = session("parent");
+    const agentId = "smoke-agent";
+    sessions.add(`${parentSession}.${agentId}`);
+    const subagentFile = fixture(
+      "subagent-bad.ts",
+      "export const o = { a: 1, a: 2 };\n",
+    );
+    await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        agent_id: agentId,
+        hook_event_name: "PostToolUse",
+        session_id: parentSession,
+        tool_input: { file_path: subagentFile },
+        tool_name: "Write",
+      },
+    });
+    const parentStop = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        hook_event_name: "Stop",
+        session_id: parentSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "the parent's Stop skips a subagent's edits",
+      parentStop.trim() === "{}",
+      `got: ${parentStop.trim().slice(0, 300)}`,
+    );
+    const subagentStop = await runHook({
+      cwd: repoRoot,
+      hook,
+      payload: {
+        agent_id: agentId,
+        hook_event_name: "SubagentStop",
+        session_id: parentSession,
+        stop_hook_active: false,
+      },
+    });
+    check(
+      "SubagentStop blocks on the subagent's own edits",
+      subagentStop.includes('"block"') &&
+        subagentStop.includes("subagent-bad.ts"),
+      `got: ${subagentStop.trim().slice(0, 300)}`,
+    );
+
     // The fixture directory is outside every knip entry, so any .ts file in it
     // is an unused file to knip: a finding in the ledger, and one beside it.
     console.log("\nUnused");

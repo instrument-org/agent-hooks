@@ -248,6 +248,19 @@ function getStopRoots({ data, repoRoot }) {
 // edits made since the previous one rather than replaying the whole session.
 // -------------------------------------------------------------------------
 
+// A subagent's hook payloads carry its parent's session_id plus its own
+// agent_id. Its edits get a ledger of their own, checked when it stops, so a
+// parent's turn end never reports a subagent's unfinished work and the
+// subagent hears about its own.
+function ledgerId(data) {
+  if (!data.session_id) {
+    return undefined;
+  }
+  return typeof data.agent_id === "string" && data.agent_id.length > 0
+    ? `${data.session_id}.${data.agent_id}`
+    : data.session_id;
+}
+
 function sessionEditsFile(sessionId) {
   return path.join(os.tmpdir(), "instrument-agent-hooks", `${sessionId}.txt`);
 }
@@ -410,7 +423,7 @@ async function recordShellEdits({ cwd, data }) {
     });
   await Promise.all(changed.map((filePath) => formatEditedFile({ filePath })));
   for (const filePath of changed) {
-    recordSessionEdit(data.session_id, filePath);
+    recordSessionEdit(ledgerId(data), filePath);
   }
 }
 
@@ -923,18 +936,20 @@ async function handleStop({ data, repoRoot }) {
   }
 
   pruneSessionEdits();
-  const editedPaths = takeSessionEdits(data.session_id);
+  const editedPaths = takeSessionEdits(ledgerId(data));
   if (editedPaths.length === 0) {
     return "{}";
   }
 
-  // Claude Code Stop only: hand remaining problems back to the agent so it
-  // fixes them in-context instead of via a manual lint run. Other runtimes
-  // (Codex "stop") do not honor the block contract, so they keep formatting
-  // silently. Skip when stop_hook_active so the agent gets a single fix attempt
-  // (no loops).
+  // Claude Code Stop and SubagentStop only: hand remaining problems back to
+  // the agent so it fixes them in-context instead of via a manual lint run.
+  // Other runtimes (Codex "stop") do not honor the block contract, so they
+  // keep formatting silently. Skip when stop_hook_active so the agent gets a
+  // single fix attempt (no loops).
   const shouldReport =
-    data.hook_event_name === "Stop" && data.stop_hook_active !== true;
+    (data.hook_event_name === "Stop" ||
+      data.hook_event_name === "SubagentStop") &&
+    data.stop_hook_active !== true;
 
   // Each file is checked from its own checkout, so a session that edited a
   // worktree and then left it still has that work checked by the worktree's
@@ -966,7 +981,7 @@ async function handleEdit({ cwd, data, eventName }) {
   ) {
     const filePath = path.resolve(data.file_path);
     await formatEditedFile({ filePath });
-    recordSessionEdit(data.session_id, filePath);
+    recordSessionEdit(ledgerId(data), filePath);
     return;
   }
 
@@ -992,7 +1007,7 @@ async function handleEdit({ cwd, data, eventName }) {
       filePaths.map((filePath) => formatEditedFile({ filePath })),
     );
     for (const filePath of filePaths) {
-      recordSessionEdit(data.session_id, filePath);
+      recordSessionEdit(ledgerId(data), filePath);
     }
     return;
   }
@@ -1004,7 +1019,7 @@ async function handleEdit({ cwd, data, eventName }) {
   ) {
     const filePath = path.resolve(data.tool_input.file_path);
     await formatEditedFile({ filePath });
-    recordSessionEdit(data.session_id, filePath);
+    recordSessionEdit(ledgerId(data), filePath);
   }
 }
 
@@ -1025,7 +1040,7 @@ try {
   const repoRoot = await getRepoRoot(cwd);
   const eventName = normalizeEventName(data.hook_event_name);
 
-  if (eventName === "Stop") {
+  if (eventName === "Stop" || eventName === "SubagentStop") {
     result = await handleStop({ data, repoRoot });
   } else {
     await handleEdit({ cwd, data, eventName });
