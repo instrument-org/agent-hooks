@@ -17,7 +17,7 @@ That instruction is only true because the hook runs. If the hook stops working, 
 | `PostToolUse` (`Bash`)          | Claude Code | oxfmt and record each dirty file the command changed                               |
 | `PostToolUse` (`apply_patch`)   | Codex       | oxfmt each patched file, record them                                               |
 | `afterFileEdit`                 | Cursor      | oxfmt the one file, record it                                                      |
-| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains, what knip finds unused, and related tests that fail |
+| `Stop` / `stop`                 | all         | format + lint-fix the turn's edits, report what remains, what knip finds unused, related tests that fail, and the repo's own `scripts/turn-end.ts` |
 | `SubagentStop`                  | Claude Code | the same as `Stop`, for the subagent's own edits                                    |
 
 Cursor sends camelCase event names and Claude Code sends PascalCase; `normalizeEventName` folds them together. The blocking report is gated on the raw `hook_event_name === "Stop"` rather than the normalized value, because only Claude Code honours the block contract.
@@ -44,12 +44,16 @@ A file counts only when the command's text contains its name. Without that, a pa
 
 At `Stop`, for the files this turn edited:
 
-1. `typos --write-changes` over every edited file, whatever its type
-2. `oxfmt` over everything formattable
-3. `oxlint --fix` over the lintable subset, plus `--type-aware --quiet` when reporting
-4. `oxfmt` again, but only over files a fixer actually rewrote
-5. `knip`, when reporting and the turn edited code or a `package.json`
-6. `vitest related`, when reporting, alongside knip
+1. the checkout's own `scripts/turn-end.ts --regenerate`, when it has one
+2. `typos --write-changes` over every edited file, whatever its type
+3. `oxfmt` over everything formattable
+4. `oxlint --fix` over the lintable subset, plus `--type-aware --quiet` when reporting
+5. `oxfmt` again, but only over files a fixer actually rewrote
+6. `knip`, when reporting and the turn edited code or a `package.json`
+7. `vitest related`, when reporting, alongside knip
+8. the checkout's own `scripts/turn-end.ts`, when reporting
+
+A repo's own checks live in that repo, so they change with its code and a checkout runs the version it has: `scripts/turn-end.ts`, given the turn's edited files in the checkout relative to its root, prints what is left to fix and nothing when that is nothing. With `--regenerate` it rewrites a file a test holds equal to an edited source, first, so that no test below reads the stale file; without it, last, it runs the checks the repo keeps for edits `vitest related` cannot trace. What either prints joins the report, and only a reporting Stop shows it. A checkout without the script skips both.
 
 The order matters. typos runs first so everything after it formats corrected text. The trailing oxfmt exists because lint fixes change layout, and it is filtered by an mtime comparison so an unchanged file does not pay for a second pass.
 

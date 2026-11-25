@@ -842,6 +842,30 @@ async function formatFiles(repoRoot, relativePaths, { report = false } = {}) {
   return { lint: lintReport, tests, unused };
 }
 
+// A checkout's own end-of-turn checks: `scripts/turn-end.ts`, when it has one,
+// over the files the turn edited there. `--regenerate` rewrites what a test
+// holds equal to an edited source, before anything reads it; without the flag
+// it runs the checks the repo keeps for edits that `vitest related` cannot
+// trace. It prints what is left to fix, and nothing when that is nothing.
+const TURN_END_SCRIPT = "scripts/turn-end.ts";
+const TURN_END_TIMEOUT_MS = 60_000;
+
+async function runTurnEnd(repoRoot, relativePaths, { regenerate = false } = {}) {
+  if (!fileExists(path.join(repoRoot, TURN_END_SCRIPT))) {
+    return "";
+  }
+  const { stdout } = await execTool(
+    process.execPath,
+    [
+      TURN_END_SCRIPT,
+      ...(regenerate ? ["--regenerate"] : []),
+      ...relativePaths,
+    ],
+    { cwd: repoRoot, timeout: TURN_END_TIMEOUT_MS },
+  );
+  return stdout;
+}
+
 // PostToolUse stays deliberately cheap: a single oxfmt on the one file that
 // changed. Lint autofixes are batched at Stop instead of paid per edit.
 async function formatEditedFile({ filePath }) {
@@ -870,7 +894,7 @@ function truncate(report) {
     : body;
 }
 
-function buildReason({ lint, tests, unused }) {
+function buildReason({ lint, tests, turnEnd, unused }) {
   const sections = [];
   if (lint.trim()) {
     sections.push(
@@ -885,6 +909,11 @@ function buildReason({ lint, tests, unused }) {
   if (tests.trim()) {
     sections.push(
       `Tests that import what you changed fail, which fails CI's test:ci. Fix the code or the test before finishing. A failure in code you did not touch can be another agent's work in progress; if so, say that and leave it:\n\n${truncate(tests)}`,
+    );
+  }
+  if (turnEnd.trim()) {
+    sections.push(
+      `The repo's own end-of-turn checks (scripts/turn-end.ts) found these in what you changed, which would fail at landing. Fix them before finishing:\n\n${truncate(turnEnd)}`,
     );
   }
   return sections.join("\n\n");
@@ -954,16 +983,25 @@ async function handleStop({ data, repoRoot }) {
   // Each file is checked from its own checkout, so a session that edited a
   // worktree and then left it still has that work checked by the worktree's
   // tools, not by whichever checkout the session ended in.
-  const found = { lint: "", tests: "", unused: "" };
+  // A checkout's own checks go around the shared ones: what an edit made
+  // stale is written again before the related tests read it, and the rest run
+  // over the code as the fixes left it.
+  const found = { lint: "", tests: "", turnEnd: "", unused: "" };
   for (const { relativePaths, repoRoot: root } of groupByCheckout(
     editedPaths,
   )) {
+    const regenerated = await runTurnEnd(root, relativePaths, {
+      regenerate: true,
+    });
     const { lint, tests, unused } = await formatFiles(root, relativePaths, {
       report: shouldReport,
     });
     found.lint += lint;
     found.tests += tests;
     found.unused += unused;
+    if (shouldReport) {
+      found.turnEnd += regenerated + (await runTurnEnd(root, relativePaths));
+    }
   }
 
   const reason = buildReason(found);
